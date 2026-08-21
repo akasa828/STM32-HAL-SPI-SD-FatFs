@@ -1,0 +1,23 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build gcc-arm-none-eabi
+      - run: >-
+          cmake -S . -B build/${{ matrix.type }} -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/gcc-arm-none-eabi.cmake
+          -DCMAKE_BUILD_TYPE=${{ matrix.type }}
+      - run: cmake --build build/${{ matrix.type }} --parallel
+      - run: >-
+          ! grep -R -n -E 'main\.h|spi\.h|hspi[0-9]|GPIO[A-Z]|HAL_|OLED_'
+          Core/Micro_SD/SD_reader.c Core/Micro_SD/SD_reader.h
