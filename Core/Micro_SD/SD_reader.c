@@ -8,7 +8,6 @@
   ******************************************************************************
   */
 #include <string.h>
-#include <stdio.h>
 #include "stdint.h"
 #include "SD_reader.h"
 
@@ -23,6 +22,8 @@
 
 /* 块数→MB 换算：block_count * 512 / (1024*1024) */
 #define SD_BLOCKS_PER_MB  2048U
+
+static int _sd_set_speed_unlocked(SD_Card *card, uint8_t speed);
 
 /**
  * @brief 计算 SD 命令帧 CRC7（多项式 x^7+x^3+1 = 0x09，MSB 先处理）
@@ -47,13 +48,16 @@ static uint8_t _sd_crc7(const uint8_t *data)
 #endif
 
 /**
- * @brief 发送 6 字节命令帧并轮询 R1
+ * @brief 提供命令间隔，发送 6 字节命令帧并轮询 R1
  * @note  不管理 CS（调用方自行拉低/拉高），方便读取 R3/R7 等带尾随字节的应答。
  *        当卡端 CRC 已开启（SD_ENABLE_CMD_CRC && io.crc_check）时，忽略传入的 crc 占位值，
  *        为每条命令现算正确 CRC7；否则沿用调用方传入的 crc（CMD0/CMD8 的必需值或 0x01 占位）。
  */
 static uint8_t _sd_cmd_raw(const SD_Card *card, uint8_t cmd, uint32_t arg, uint8_t crc)
 {
+    /* Ncc：上一应答与下一命令之间至少保留 8 个时钟。统一放在这里，
+     * 连续 CMD、CMD55/ACMD 和重试路径不会各自遗漏。 */
+    (void)SD_IO_BYTE(card, 0xFFU);
     uint8_t frame[6];
     frame[0] = 0x40U | (cmd & 0x3FU);
     frame[1] = (uint8_t)(arg >> 24);
@@ -67,6 +71,8 @@ static uint8_t _sd_cmd_raw(const SD_Card *card, uint8_t cmd, uint32_t arg, uint8
 #endif
     const uint8_t *p = frame;
     for (uint8_t i = 0; i < sizeof(frame); ++i) (void)SD_IO_BYTE(card, *p++);
+    if (cmd == SD_CMD12)
+        (void)SD_IO_BYTE(card, 0xFFU);
     uint8_t r1 = SD_R1_NO_RESPONSE;
     for (uint8_t retry = 0; retry < 10U; ++retry)
     {
@@ -74,6 +80,14 @@ static uint8_t _sd_cmd_raw(const SD_Card *card, uint8_t cmd, uint32_t arg, uint8
         if ((r1 & 0x80U) == 0U) break;
     }
     return r1;
+}
+
+/** @brief 发送 CMD55 + ACMD；命令间隔由 _sd_cmd_raw 统一提供。 */
+static uint8_t _sd_app_cmd_raw(const SD_Card *card, uint8_t cmd, uint32_t arg)
+{
+    uint8_t r1 = _sd_cmd_raw(card, SD_CMD55, 0x00000000U, 0x01U);
+    if (r1 != 0x00U && r1 != SD_R1_IDLE_STATE) return r1;
+    return _sd_cmd_raw(card, cmd, arg, 0x01U);
 }
 
 /** @brief 等待卡返回指定数据令牌（如 0xFE 块起始令牌） */
@@ -100,6 +114,29 @@ static uint32_t _sd_to_addr(const SD_Card *card, uint32_t block_addr)
     return card->info.block_addr ? block_addr : (block_addr * SD_BLOCK_SIZE);
 }
 
+static int _sd_has_required_io(const SD_Card *card)
+{
+    return card != NULL && card->io.spi_byte != NULL &&
+           card->io.receive != NULL && card->io.send != NULL &&
+           card->io.cs_low != NULL && card->io.cs_high != NULL &&
+           card->io.set_speed != NULL && card->io.get_sck_hz != NULL &&
+           card->io.tick_ms != NULL;
+}
+
+static int _sd_validate_block_range(const SD_Card *card,
+                                    uint32_t start_block,
+                                    uint32_t count)
+{
+    if (count == 0U || card->info.block_count == 0U ||
+        start_block >= card->info.block_count ||
+        count > card->info.block_count - start_block)
+        return SD_PARAM_ERR;
+    if (!card->info.block_addr &&
+        start_block + count - 1U > UINT32_MAX / SD_BLOCK_SIZE)
+        return SD_PARAM_ERR;
+    return SD_OK;
+}
+
 /**
  * @brief 重入保护：原子地“测试并置位”busy 标志
  * @note  单核 M3 上用关中断构造临界区，防止 ISR 在事务中途进入同一句柄破坏总线。
@@ -108,7 +145,7 @@ static uint32_t _sd_to_addr(const SD_Card *card, uint32_t block_addr)
 static int _sd_lock(SD_Card *card)
 {
     int ok;
-    uint32_t state = card->io.enter_critical != NULL
+    uint32_t state = card->io.enter_critical != NULL && card->io.exit_critical != NULL
         ? card->io.enter_critical(card->io.context) : 0U;
     if (card->busy) { ok = SD_BUSY; }
     else            { card->busy = 1U; ok = SD_OK; }
@@ -128,15 +165,79 @@ static void _sd_unlock(SD_Card *card)
  * @note  通过 IO 抽象的回调读取总线时钟 + prescaler，不硬编码 MCU 频率，跨平台。
  *         注意：修改 card->info.speed，故传入非 const 指针。
  */
-static uint8_t _sd_detect_speed(SD_Card *card)
+static int _sd_prepare_init_speed(SD_Card *card)
 {
     uint32_t sck = card->io.get_sck_hz(card->io.context);
+    if (sck == 0U) return SD_ERR;
     if (sck <= 400000UL)
     {
         card->info.speed = SD_SPI_SPEED_LOW;
-        return SD_SPI_SPEED_LOW;
+        return SD_OK;
     }
-    return SD_SPI_SPEED_HIGH;
+    if (_sd_set_speed_unlocked(card, SD_SPI_SPEED_LOW) != SD_OK) return SD_ERR;
+    sck = card->io.get_sck_hz(card->io.context);
+    return (sck != 0U && sck <= 400000UL) ? SD_OK : SD_ERR;
+}
+
+static int _sd_read_data_packet(const SD_Card *card,
+                                uint8_t *data,
+                                uint16_t length,
+                                uint32_t timeout_ms)
+{
+    int result = _sd_wait_token(card, SD_TOKEN_START_BLOCK, timeout_ms);
+    if (result != SD_OK) return result;
+    result = card->io.receive(card->io.context, data, length);
+    if (result != SD_OK) return result;
+    uint16_t received_crc = (uint16_t)((uint16_t)SD_IO_BYTE(card, 0xFFU) << 8);
+    received_crc |= SD_IO_BYTE(card, 0xFFU);
+    if (card->io.crc_check && received_crc != SD_CRC16(data, length))
+        return SD_CRC_ERR;
+    return SD_OK;
+}
+
+static int _sd_read_register_unlocked(const SD_Card *card,
+                                      uint8_t command,
+                                      uint8_t *data,
+                                      uint16_t length)
+{
+    SD_IO_CS_LOW(card);
+    uint8_t r1 = _sd_cmd_raw(card, command, 0U, 0x01U);
+    int result = (r1 == 0U)
+        ? _sd_read_data_packet(card, data, length, 200U)
+        : SD_ERR;
+    SD_IO_CS_HIGH(card);
+    return result;
+}
+
+static int _sd_write_data_packet(const SD_Card *card,
+                                 uint8_t token,
+                                 const uint8_t *data,
+                                 uint16_t length)
+{
+    (void)SD_IO_BYTE(card, token);
+    int result = card->io.send(card->io.context, data, length);
+    if (result != SD_OK) return result;
+    uint16_t crc = card->io.crc_check ? SD_CRC16(data, length) : 0xFFFFU;
+    (void)SD_IO_BYTE(card, (uint8_t)(crc >> 8));
+    (void)SD_IO_BYTE(card, (uint8_t)crc);
+    return ((SD_IO_BYTE(card, 0xFFU) & SD_DATA_RESP_MASK) == SD_DATA_RESP_ACCEPTED)
+        ? SD_OK : SD_ERR;
+}
+
+static int _sd_stop_multi_read(const SD_Card *card)
+{
+    uint8_t r1 = _sd_cmd_raw(card, SD_CMD12, 0U, 0x01U);
+    if (r1 != 0x00U) return SD_ERR;
+    return _sd_wait_ready(card, 200U);
+}
+
+static int _sd_finish_multi_write(const SD_Card *card)
+{
+    int result = _sd_wait_ready(card, 500U);
+    if (result != SD_OK) return result;
+    (void)SD_IO_BYTE(card, SD_TOKEN_STOP_TRAN);
+    (void)SD_IO_BYTE(card, 0xFFU);
+    return _sd_wait_ready(card, 500U);
 }
 
 /*====================================================================
@@ -189,6 +290,7 @@ static const uint16_t k_crc16_tab[256] = {
  */
 uint16_t SD_CRC16(const uint8_t *data, uint16_t len)
 {
+    if (data == NULL && len != 0U) return 0U;
     uint16_t crc = 0;
     for (uint16_t n = 0; n < len; ++n)
         crc = (uint16_t)((crc << 8) ^ k_crc16_tab[(uint8_t)((crc >> 8) ^ data[n])]);
@@ -203,7 +305,9 @@ int SD_Card_BindIO(SD_Card *card, const SD_IO *io)
     if (card == NULL || io == NULL || io->spi_byte == NULL ||
         io->receive == NULL || io->send == NULL || io->cs_low == NULL ||
         io->cs_high == NULL || io->set_speed == NULL ||
-        io->get_sck_hz == NULL || io->tick_ms == NULL) return SD_PARAM_ERR;
+        io->get_sck_hz == NULL || io->tick_ms == NULL ||
+        ((io->enter_critical == NULL) != (io->exit_critical == NULL)))
+        return SD_PARAM_ERR;
     card->io = *io;
     (void)memset(&card->info, 0x00, sizeof(card->info));
     card->info.type  = SD_TYPE_NONE;
@@ -216,19 +320,29 @@ int SD_Card_BindIO(SD_Card *card, const SD_IO *io)
 //  SD_Set_Speed_Card -- 动态调整 SPI 时钟速率档
 //====================================================================
 //  握手阶段必须 <400kHz，进入 SPI 模式后应切高速。
-//  啊啊啊，搞什么啊，我要的握手啊，不是牵红线！怎么这么难改啊！代码也没错啊
 //  内部通过改写 SPI prescaler 寄存器并重初始化外设实现。
 //  若已在目标速率则跳过重初始化（零开销）。
 //  speed 参数：只能是 SD_SPI_SPEED_LOW 或 SD_SPI_SPEED_HIGH，
 //  传 SD_SPI_SPEED_NULL 返回 SD_PARAM_ERR。
-int SD_Set_Speed_Card(SD_Card *card, uint8_t speed)
+static int _sd_set_speed_unlocked(SD_Card *card, uint8_t speed)
 {
     if (card == NULL) return SD_PARAM_ERR;
+    if (speed != SD_SPI_SPEED_LOW && speed != SD_SPI_SPEED_HIGH)
+        return SD_PARAM_ERR;
     if (speed == card->info.speed) return SD_OK;
-    if (speed == SD_SPI_SPEED_NULL) return SD_PARAM_ERR;
     if (card->io.set_speed(card->io.context, speed) != SD_OK) return SD_ERR;
     card->info.speed = speed;
     return SD_OK;
+}
+
+int SD_Set_Speed_Card(SD_Card *card, uint8_t speed)
+{
+    if (!_sd_has_required_io(card)) return SD_PARAM_ERR;
+    int result = _sd_lock(card);
+    if (result != SD_OK) return result;
+    result = _sd_set_speed_unlocked(card, speed);
+    _sd_unlock(card);
+    return result;
 }
 
 //====================================================================
@@ -238,23 +352,15 @@ int SD_Set_Speed_Card(SD_Card *card, uint8_t speed)
 //  CMD8 版本探测 → ACMD41 轮询启动 → CMD58 读 OCR 判 SDHC →
 //  CMD16 设块长（非 SDHC）→ CMD9 读 CSD 算容量 → CMD10 读 CID →
 //  切高速时钟。所有结果写入 card->info。
-int SD_Init_Card(SD_Card *card)
+static int _sd_initialize_unlocked(SD_Card *card)
 {
-    if (card == NULL) return SD_PARAM_ERR;
-    /* 校验所有必需回调，避免部分填充的 SD_IO 触发 NULL 函数指针调用 → HardFault */
-    if (card->io.spi_byte == NULL || card->io.receive == NULL || card->io.send == NULL ||
-        card->io.cs_low == NULL   || card->io.cs_high == NULL  || card->io.set_speed == NULL ||
-        card->io.get_sck_hz == NULL || card->io.tick_ms == NULL)
-        return SD_PARAM_ERR;
-
     /* 先置未就绪并清零，握手成功后再原子发布，避免并发读到 initialized=1 而 block_addr 尚为 0 */
     card->info.initialized = 0U;
     (void)memset(&card->info, 0x00, sizeof(card->info));
     card->info.type  = SD_TYPE_NONE;
     card->info.speed = SD_SPI_SPEED_NULL;
 
-    if (_sd_detect_speed(card) == SD_SPI_SPEED_HIGH)
-        (void)SD_Set_Speed_Card(card, SD_SPI_SPEED_LOW);
+    if (_sd_prepare_init_speed(card) != SD_OK) return SD_ERR;
 
     /* 1) >=74 idle clocks */
     SD_IO_CS_HIGH(card);
@@ -304,17 +410,13 @@ int SD_Init_Card(SD_Card *card)
     }
 #endif
 
-    /* 4) ACMD41。先确认 CMD55 被接受（R1 bit7=0）再发 ACMD41，否则严格卡会把
-     *    后续帧当普通 CMD41（保留命令）置非法位，导致循环空转到超时。 */
+    /* 4) ACMD41。CMD55 与 ACMD41 之间保留一个字节的命令间隔，兼容需要
+     *    明确 Ncr/Ncc 时序裕量的卡。 */
     uint32_t arg41 = (card_type == SD_TYPE_V2) ? 0x40000000U : 0x00000000U;
     uint32_t t0 = SD_IO_TICK(card);
     do {
         SD_IO_CS_LOW(card);
-        uint8_t r55 = _sd_cmd_raw(card, SD_CMD55, 0x00000000U, 0x01U);
-        if ((r55 & 0x80U) == 0U)
-            r1 = _sd_cmd_raw(card, SD_ACMD41, arg41, 0x01U);
-        else
-            r1 = SD_R1_NO_RESPONSE;   /* CMD55 未被接受，本轮重试 */
+        r1 = _sd_app_cmd_raw(card, SD_ACMD41, arg41);
         SD_IO_CS_HIGH(card);
         if ((SD_IO_TICK(card) - t0) > SD_ACMD41_TIMEOUT_MS) return SD_TIMEOUT;   /* 可配置上电裕量 */
     } while (r1 != 0x00U);
@@ -324,15 +426,14 @@ int SD_Init_Card(SD_Card *card)
     {
         SD_IO_CS_LOW(card);
         r1 = _sd_cmd_raw(card, SD_CMD58, 0x00000000U, 0x01U);
-        if (r1 == 0x00U)
-        {
-            uint8_t ocr[4];
-            for (uint8_t i = 0; i < 4U; ++i) ocr[i] = SD_IO_BYTE(card, 0xFFU);
-            card->info.ocr = ((uint32_t)ocr[0] << 24) | ((uint32_t)ocr[1] << 16)
-                           | ((uint32_t)ocr[2] <<  8) |  (uint32_t)ocr[3];
-            if (ocr[0] & 0x40U) card_type = SD_TYPE_V2HC;
-        }
+        if (r1 != 0x00U) { SD_IO_CS_HIGH(card); return SD_ERR; }
+        uint8_t ocr[4];
+        for (uint8_t i = 0; i < 4U; ++i) ocr[i] = SD_IO_BYTE(card, 0xFFU);
         SD_IO_CS_HIGH(card);
+        card->info.ocr = ((uint32_t)ocr[0] << 24) | ((uint32_t)ocr[1] << 16)
+                       | ((uint32_t)ocr[2] <<  8) |  (uint32_t)ocr[3];
+        if ((card->info.ocr & 0x80000000UL) == 0U) return SD_ERR;
+        if (ocr[0] & 0x40U) card_type = SD_TYPE_V2HC;
     }
 
     /* 6) CMD16（非 SDHC 设块长 512）。检查 R1：正常 512 是上电默认值，
@@ -347,16 +448,11 @@ int SD_Init_Card(SD_Card *card)
 
     /* 7) CSD */
     {
-        SD_IO_CS_LOW(card);
-        r1 = _sd_cmd_raw(card, SD_CMD9, 0x00000000U, 0x01U);
-        if (r1 != 0x00U) { SD_IO_CS_HIGH(card); return SD_ERR; }
-        if (_sd_wait_token(card, SD_TOKEN_START_BLOCK, 200U) != SD_OK)
-        { SD_IO_CS_HIGH(card); return SD_TIMEOUT; }
         uint8_t csd[16];
-        for (uint8_t i = 0; i < 16U; ++i) csd[i] = SD_IO_BYTE(card, 0xFFU);
+        int packet_result = _sd_read_register_unlocked(card, SD_CMD9,
+                                                       csd, sizeof(csd));
+        if (packet_result != SD_OK) return packet_result;
         (void)memcpy(card->info.csd_raw, csd, 16U);
-        (void)SD_IO_BYTE(card, 0xFFU); (void)SD_IO_BYTE(card, 0xFFU);
-        SD_IO_CS_HIGH(card);
         uint8_t ver = (csd[0] >> 6) & 0x03U;
         if (ver == 0x01U)
         {
@@ -370,33 +466,39 @@ int SD_Init_Card(SD_Card *card)
             uint16_t csize = ((uint16_t)(csd[6] & 0x03U) << 10) | ((uint16_t)csd[7] << 2) | ((uint16_t)csd[8] >> 6);
             uint8_t  cmult = ((csd[9] & 0x03U) << 1) | ((csd[10] >> 7) & 0x01U);
             uint8_t  blen  = csd[5] & 0x0FU;
-            uint32_t blknr = (uint32_t)(csize + 1U) * (uint32_t)(1UL << (cmult + 2U));
-            card->info.block_count = blknr * ((uint32_t)(1UL << blen) / SD_BLOCK_SIZE);
+            if (blen > 11U) return SD_ERR;
+            uint64_t bytes = ((uint64_t)csize + 1U) *
+                             ((uint64_t)1U << (cmult + 2U)) *
+                             ((uint64_t)1U << blen);
+            uint64_t bc = bytes / SD_BLOCK_SIZE;
+            card->info.block_count = (bc > UINT32_MAX) ? UINT32_MAX : (uint32_t)bc;
         }
-        else { card->info.block_count = 0U; }
+        else { return SD_ERR; }
+        if (card->info.block_count == 0U) return SD_ERR;
         card->info.capacity_mb = card->info.block_count / SD_BLOCKS_PER_MB;
     }
 
     /* 8) CID */
-    {
-        SD_IO_CS_LOW(card);
-        r1 = _sd_cmd_raw(card, SD_CMD10, 0x00000000U, 0x01U);
-        if (r1 != 0x00U) { SD_IO_CS_HIGH(card); (void)memset(card->info.cid_raw, 0x00, 16U); }
-        else if (_sd_wait_token(card, SD_TOKEN_START_BLOCK, 200U) != SD_OK)
-        { SD_IO_CS_HIGH(card); (void)memset(card->info.cid_raw, 0x00, 16U); }
-        else
-        {
-            for (uint8_t i = 0; i < 16U; ++i) card->info.cid_raw[i] = SD_IO_BYTE(card, 0xFFU);
-            (void)SD_IO_BYTE(card, 0xFFU); (void)SD_IO_BYTE(card, 0xFFU);
-            SD_IO_CS_HIGH(card);
-        }
-    }
+    int cid_result = _sd_read_register_unlocked(card, SD_CMD10,
+                                                card->info.cid_raw,
+                                                sizeof(card->info.cid_raw));
+    if (cid_result != SD_OK) return cid_result;
 
     card->info.type        = card_type;
     card->info.block_addr  = (card_type == SD_TYPE_V2HC) ? 1U : 0U;
-    (void)SD_Set_Speed_Card(card, SD_SPI_SPEED_HIGH);
+    if (_sd_set_speed_unlocked(card, SD_SPI_SPEED_HIGH) != SD_OK) return SD_ERR;
     card->info.initialized = 1U;   /* 全部就绪后最后发布，确保读到 initialized=1 时信息完整 */
     return (int)card_type;
+}
+
+int SD_Init_Card(SD_Card *card)
+{
+    if (!_sd_has_required_io(card)) return SD_PARAM_ERR;
+    int result = _sd_lock(card);
+    if (result != SD_OK) return result;
+    result = _sd_initialize_unlocked(card);
+    _sd_unlock(card);
+    return result;
 }
 
 //====================================================================
@@ -408,10 +510,10 @@ int SD_Init_Card(SD_Card *card)
 int SD_Read_Block_Card(SD_Card *card, uint32_t block_addr, uint8_t *buf)
 {
     if (card == NULL || buf == NULL || !card->info.initialized) return SD_PARAM_ERR;
+    if (_sd_validate_block_range(card, block_addr, 1U) != SD_OK) return SD_PARAM_ERR;
     if (_sd_lock(card) != SD_OK) return SD_BUSY;
 
     int     result    = SD_ERR;
-    uint8_t crc_en    = card->io.crc_check;
     uint8_t downshift = 0U;   /* 是否已为重试临时降速 */
     for (uint8_t attempt = 0; attempt <= SD_CRC_RETRY_MAX; ++attempt)
     {
@@ -421,35 +523,21 @@ int SD_Read_Block_Card(SD_Card *card, uint32_t block_addr, uint8_t *buf)
             SD_IO_CS_HIGH(card);
             result = SD_ERR;
         }
-        else if (_sd_wait_token(card, SD_TOKEN_START_BLOCK, 200U) != SD_OK)
-        {
-            SD_IO_CS_HIGH(card);
-            result = SD_TIMEOUT;
-        }
-        else if (card->io.receive(card->io.context, buf, SD_BLOCK_SIZE) != SD_OK)
-        {
-            /* 超时时 DMA 已 Abort，补几个时钟让卡结束数据相再抬 CS，避免下次命令失步 */
-            for (uint8_t k = 0; k < 2U; ++k) (void)SD_IO_BYTE(card, 0xFFU);
-            SD_IO_CS_HIGH(card);
-            result = SD_ERR;
-        }
         else
         {
-            uint8_t crc_h = SD_IO_BYTE(card, 0xFFU), crc_l = SD_IO_BYTE(card, 0xFFU);
+            result = _sd_read_data_packet(card, buf, SD_BLOCK_SIZE, 200U);
             SD_IO_CS_HIGH(card);
-            if (!crc_en || (((uint16_t)crc_h << 8) | crc_l) == SD_CRC16(buf, SD_BLOCK_SIZE))
-            { result = SD_OK; break; }
-            result = SD_CRC_ERR;
+            if (result == SD_OK) break;
         }
 
         /* 还有重试机会则降速一档（仅降一次），下一轮在低速下重读以恢复信号质量 */
         if (attempt < SD_CRC_RETRY_MAX && !downshift && card->info.speed == SD_SPI_SPEED_HIGH)
         {
-            if (SD_Set_Speed_Card(card, SD_SPI_SPEED_LOW) == SD_OK) downshift = 1U;
+            if (_sd_set_speed_unlocked(card, SD_SPI_SPEED_LOW) == SD_OK) downshift = 1U;
         }
     }
 
-    if (downshift) (void)SD_Set_Speed_Card(card, SD_SPI_SPEED_HIGH);   /* 恢复高速 */
+    if (downshift) (void)_sd_set_speed_unlocked(card, SD_SPI_SPEED_HIGH);   /* 恢复高速 */
     _sd_unlock(card);
     return result;
 }
@@ -462,6 +550,7 @@ int SD_Read_Block_Card(SD_Card *card, uint32_t block_addr, uint8_t *buf)
 int SD_Write_Block_Card(SD_Card *card, uint32_t block_addr, const uint8_t *buf)
 {
     if (card == NULL || buf == NULL || !card->info.initialized) return SD_PARAM_ERR;
+    if (_sd_validate_block_range(card, block_addr, 1U) != SD_OK) return SD_PARAM_ERR;
     if (_sd_lock(card) != SD_OK) return SD_BUSY;
 
     int result;
@@ -469,16 +558,9 @@ int SD_Write_Block_Card(SD_Card *card, uint32_t block_addr, const uint8_t *buf)
     if (_sd_cmd_raw(card, SD_CMD24, _sd_to_addr(card, block_addr), 0x01U) != 0x00U)
     { SD_IO_CS_HIGH(card); _sd_unlock(card); return SD_ERR; }
     (void)SD_IO_BYTE(card, 0xFFU);
-    (void)SD_IO_BYTE(card, SD_TOKEN_START_BLOCK);
-    if (card->io.send(card->io.context, buf, SD_BLOCK_SIZE) != SD_OK)
-    { SD_IO_CS_HIGH(card); _sd_unlock(card); return SD_ERR; }
-    /* 仅在 crc_check 开启时算 CRC，否则发 0xFFFF 占位（SPI 模式卡默认不校验写 CRC） */
-    uint16_t crc = card->io.crc_check ? SD_CRC16(buf, SD_BLOCK_SIZE) : 0xFFFFU;
-    (void)SD_IO_BYTE(card, (uint8_t)(crc >> 8));
-    (void)SD_IO_BYTE(card, (uint8_t)crc);
-    uint8_t resp = SD_IO_BYTE(card, 0xFFU);
-    if ((resp & SD_DATA_RESP_MASK) != SD_DATA_RESP_ACCEPTED)
-    { SD_IO_CS_HIGH(card); _sd_unlock(card); return SD_ERR; }
+    result = _sd_write_data_packet(card, SD_TOKEN_START_BLOCK, buf, SD_BLOCK_SIZE);
+    if (result != SD_OK)
+    { SD_IO_CS_HIGH(card); _sd_unlock(card); return result; }
     result = _sd_wait_ready(card, 500U);
     SD_IO_CS_HIGH(card);
     _sd_unlock(card);
@@ -493,26 +575,21 @@ int SD_Write_Block_Card(SD_Card *card, uint32_t block_addr, const uint8_t *buf)
 int SD_Read_Multi_Block_Card(SD_Card *card, uint32_t block_addr, uint8_t *buf, uint32_t count)
 {
     if (card == NULL || buf == NULL || count == 0U || !card->info.initialized) return SD_PARAM_ERR;
+    if (_sd_validate_block_range(card, block_addr, count) != SD_OK) return SD_PARAM_ERR;
     if (_sd_lock(card) != SD_OK) return SD_BUSY;
     SD_IO_CS_LOW(card);
     if (_sd_cmd_raw(card, SD_CMD18, _sd_to_addr(card, block_addr), 0x01U) != 0x00U)
     { SD_IO_CS_HIGH(card); _sd_unlock(card); return SD_ERR; }
     int result = SD_OK;
-    uint8_t *p = buf, crc_en = card->io.crc_check;
+    uint8_t *p = buf;
     for (uint32_t i = 0; i < count; ++i)
     {
-        if (_sd_wait_token(card, SD_TOKEN_START_BLOCK, 200U) != SD_OK) { result = SD_TIMEOUT; break; }
-        if (card->io.receive(card->io.context, p, SD_BLOCK_SIZE) != SD_OK) { result = SD_ERR; break; }
-        uint8_t crc_h = SD_IO_BYTE(card, 0xFFU), crc_l = SD_IO_BYTE(card, 0xFFU);
-        if (crc_en && ((((uint16_t)crc_h << 8) | crc_l) != SD_CRC16(p, SD_BLOCK_SIZE)))
-        { result = SD_CRC_ERR; break; }
+        result = _sd_read_data_packet(card, p, SD_BLOCK_SIZE, 200U);
+        if (result != SD_OK) break;
         p += SD_BLOCK_SIZE;
     }
-    /* CMD18 为开放式，发 CMD12 时卡可能仍在流式输出：先补 1 个填充字节再发停止命令，
-     * 避免把在途数据字节（MSB 可能为 0）误当成 R1。 */
-    (void)SD_IO_BYTE(card, 0xFFU);
-    (void)_sd_cmd_raw(card, SD_CMD12, 0x00000000U, 0x01U);
-    (void)_sd_wait_ready(card, 200U);
+    int stop_result = _sd_stop_multi_read(card);
+    if (result == SD_OK && stop_result != SD_OK) result = stop_result;
     SD_IO_CS_HIGH(card);
     _sd_unlock(card);
     return result;
@@ -527,11 +604,10 @@ int SD_Read_Multi_Block_Card(SD_Card *card, uint32_t block_addr, uint8_t *buf, u
 int SD_Write_Multi_Block_Card(SD_Card *card, uint32_t block_addr, const uint8_t *buf, uint32_t count)
 {
     if (card == NULL || buf == NULL || count == 0U || !card->info.initialized) return SD_PARAM_ERR;
+    if (_sd_validate_block_range(card, block_addr, count) != SD_OK) return SD_PARAM_ERR;
     if (_sd_lock(card) != SD_OK) return SD_BUSY;
-    uint8_t crc_en = card->io.crc_check;
     SD_IO_CS_LOW(card);
-    if (_sd_cmd_raw(card, SD_CMD55, 0x00000000U, 0x01U) == 0x00U)
-        (void)_sd_cmd_raw(card, SD_ACMD23, count, 0x01U);
+    (void)_sd_app_cmd_raw(card, SD_ACMD23, count); /* 可选优化，失败不阻止 CMD25 */
     if (_sd_cmd_raw(card, SD_CMD25, _sd_to_addr(card, block_addr), 0x01U) != 0x00U)
     { SD_IO_CS_HIGH(card); _sd_unlock(card); return SD_ERR; }
     int result = SD_OK;
@@ -539,19 +615,12 @@ int SD_Write_Multi_Block_Card(SD_Card *card, uint32_t block_addr, const uint8_t 
     for (uint32_t i = 0; i < count; ++i)
     {
         if (_sd_wait_ready(card, 500U) != SD_OK) { result = SD_TIMEOUT; break; }
-        (void)SD_IO_BYTE(card, SD_TOKEN_START_MULTI);
-        if (card->io.send(card->io.context, p, SD_BLOCK_SIZE) != SD_OK) { result = SD_ERR; break; }
-        uint16_t crc = crc_en ? SD_CRC16(p, SD_BLOCK_SIZE) : 0xFFFFU;
-        (void)SD_IO_BYTE(card, (uint8_t)(crc >> 8));
-        (void)SD_IO_BYTE(card, (uint8_t)crc);
-        if ((SD_IO_BYTE(card, 0xFFU) & SD_DATA_RESP_MASK) != SD_DATA_RESP_ACCEPTED)
-        { result = SD_ERR; break; }
+        result = _sd_write_data_packet(card, SD_TOKEN_START_MULTI, p, SD_BLOCK_SIZE);
+        if (result != SD_OK) break;
         p += SD_BLOCK_SIZE;
     }
-    (void)_sd_wait_ready(card, 500U);
-    (void)SD_IO_BYTE(card, SD_TOKEN_STOP_TRAN);
-    (void)SD_IO_BYTE(card, 0xFFU);
-    (void)_sd_wait_ready(card, 500U);
+    int finish_result = _sd_finish_multi_write(card);
+    if (result == SD_OK && finish_result != SD_OK) result = finish_result;
     SD_IO_CS_HIGH(card);
     _sd_unlock(card);
     return result;
@@ -566,6 +635,10 @@ int SD_Write_Multi_Block_Card(SD_Card *card, uint32_t block_addr, const uint8_t 
 int SD_Erase_Blocks_Card(SD_Card *card, uint32_t start_block, uint32_t end_block)
 {
     if (card == NULL || !card->info.initialized || end_block < start_block) return SD_PARAM_ERR;
+    if (end_block >= card->info.block_count ||
+        _sd_validate_block_range(card, start_block,
+                                 end_block - start_block + 1U) != SD_OK)
+        return SD_PARAM_ERR;
     if (_sd_lock(card) != SD_OK) return SD_BUSY;
     int status;
     SD_IO_CS_LOW(card);
@@ -587,15 +660,21 @@ int SD_Erase_Blocks_Card(SD_Card *card, uint32_t start_block, uint32_t end_block
 //  SPI 模式 R2 = 2 字节：第 1 字节为 R1（_sd_cmd_raw 已消耗，作为返回值），
 //  第 2 字节为 SPI 专用状态。本函数再读 1 字节即可，返回 (R1<<8)|byte2。
 //  可直接与 SD_R2_* 宏做位运算，或用 SD_Decode_Status() 转可读字符串。
-int SD_Get_Status_Card(const SD_Card *card, uint16_t *status)
+int SD_Get_Status_Card(SD_Card *card, uint16_t *status)
 {
     if (card == NULL || status == NULL || !card->info.initialized) return SD_PARAM_ERR;
+    if (_sd_lock(card) != SD_OK) return SD_BUSY;
     SD_IO_CS_LOW(card);
     uint8_t r1 = _sd_cmd_raw(card, SD_CMD13, 0x00000000U, 0x01U);
-    if (r1 == SD_R1_NO_RESPONSE) { SD_IO_CS_HIGH(card); return SD_ERR; }
+    if (r1 == SD_R1_NO_RESPONSE) {
+        SD_IO_CS_HIGH(card);
+        _sd_unlock(card);
+        return SD_ERR;
+    }
     uint8_t r2b = SD_IO_BYTE(card, 0xFFU);   /* R2 仅 2 字节，再读 1 字节即第二状态字节 */
     *status = (uint16_t)(((uint16_t)r1 << 8) | r2b);
     SD_IO_CS_HIGH(card);
+    _sd_unlock(card);
     return SD_OK;
 }
 
@@ -604,13 +683,18 @@ int SD_Get_Status_Card(const SD_Card *card, uint16_t *status)
 //====================================================================
 int SD_Card_IsPresent_Card(SD_Card *card)
 {
-    if (card == NULL || !card->info.initialized || card->busy) return 0;
+    if (card == NULL || !card->info.initialized || _sd_lock(card) != SD_OK) return 0;
     SD_IO_CS_LOW(card);
     uint8_t r1 = _sd_cmd_raw(card, SD_CMD58, 0x00000000U, 0x01U);
-    if (r1 & 0x80U) { SD_IO_CS_HIGH(card); return 0; }
+    if (r1 & 0x80U) {
+        SD_IO_CS_HIGH(card);
+        _sd_unlock(card);
+        return 0;
+    }
     uint8_t ocr[4];
     for (uint8_t i = 0; i < 4U; ++i) ocr[i] = SD_IO_BYTE(card, 0xFFU);
     SD_IO_CS_HIGH(card);
+    _sd_unlock(card);
     return (ocr[0] & 0x80U) ? 1 : 0;
 }
 
@@ -619,38 +703,30 @@ int SD_Card_IsPresent_Card(SD_Card *card)
 //====================================================================
 //  CID 含制造商 ID、OEM ID、产品名、版本、序列号、制造日期。
 //  SD_Init_Card() 内部已读取并存于 card->info.cid_raw，通常无需再次调用。
-int SD_Get_CID_Card(const SD_Card *card, uint8_t buf[16])
+int SD_Get_CID_Card(SD_Card *card, uint8_t buf[16])
 {
     if (card == NULL || buf == NULL || !card->info.initialized) return SD_PARAM_ERR;
-    SD_IO_CS_LOW(card);
-    if (_sd_cmd_raw(card, SD_CMD10, 0x00000000U, 0x01U) != 0x00U)
-    { SD_IO_CS_HIGH(card); return SD_ERR; }
-    if (_sd_wait_token(card, SD_TOKEN_START_BLOCK, 200U) != SD_OK)
-    { SD_IO_CS_HIGH(card); return SD_TIMEOUT; }
-    for (uint8_t i = 0; i < 16U; ++i) buf[i] = SD_IO_BYTE(card, 0xFFU);
-    (void)SD_IO_BYTE(card, 0xFFU); (void)SD_IO_BYTE(card, 0xFFU);
-    SD_IO_CS_HIGH(card);
-    return SD_OK;
+    if (_sd_lock(card) != SD_OK) return SD_BUSY;
+    int result = _sd_read_register_unlocked(card, SD_CMD10, buf, 16U);
+    _sd_unlock(card);
+    return result;
 }
 
 //====================================================================
 //  SD_Read_SCR_Card -- ACMD51 读 SCR 8 字节
 //====================================================================
 //  SCR 含 SD 安全规范版本、总线宽度支持等信息，用于判断卡是否支持更高速度模式。
-int SD_Read_SCR_Card(const SD_Card *card, uint8_t scr[8])
+int SD_Read_SCR_Card(SD_Card *card, uint8_t scr[8])
 {
     if (card == NULL || scr == NULL || !card->info.initialized) return SD_PARAM_ERR;
+    if (_sd_lock(card) != SD_OK) return SD_BUSY;
     SD_IO_CS_LOW(card);
-    if (_sd_cmd_raw(card, SD_CMD55, 0x00000000U, 0x01U) != 0x00U)
-    { SD_IO_CS_HIGH(card); return SD_ERR; }
-    if (_sd_cmd_raw(card, SD_ACMD51, 0x00000000U, 0x01U) != 0x00U)
-    { SD_IO_CS_HIGH(card); return SD_ERR; }
-    if (_sd_wait_token(card, SD_TOKEN_START_BLOCK, 200U) != SD_OK)
-    { SD_IO_CS_HIGH(card); return SD_TIMEOUT; }
-    for (uint8_t i = 0; i < 8U; ++i) scr[i] = SD_IO_BYTE(card, 0xFFU);
-    (void)SD_IO_BYTE(card, 0xFFU); (void)SD_IO_BYTE(card, 0xFFU);
+    if (_sd_app_cmd_raw(card, SD_ACMD51, 0x00000000U) != 0x00U)
+    { SD_IO_CS_HIGH(card); _sd_unlock(card); return SD_ERR; }
+    int result = _sd_read_data_packet(card, scr, 8U, 200U);
     SD_IO_CS_HIGH(card);
-    return SD_OK;
+    _sd_unlock(card);
+    return result;
 }
 
 //====================================================================
@@ -675,11 +751,17 @@ uint8_t SD_Get_Type_Card(const SD_Card *card)
 void SD_DeInit_Card(SD_Card *card)
 {
     if (card == NULL) return;
+    uint8_t locked = 0U;
+    if (_sd_has_required_io(card)) {
+        if (_sd_lock(card) != SD_OK) return;
+        locked = 1U;
+    }
     if (card->io.deinit != NULL) card->io.deinit(card->io.context);
     (void)memset(&card->info, 0x00, sizeof(card->info));
     card->info.type  = SD_TYPE_NONE;
     card->info.speed = SD_SPI_SPEED_NULL;
     card->busy = 0U;
+    if (locked) _sd_unlock(card);
 }
 
 //====================================================================
@@ -687,19 +769,19 @@ void SD_DeInit_Card(SD_Card *card)
 //====================================================================
 //  线程安全：结果写入调用方提供的缓冲区。raw==0 输出 "OK"。
 //  各标志位以竖线分隔，如 "OUT_OF_RANGE|WP_VIOLATION"。
-//  15 个标志全置位时结果 160 字节，_sd_status_append 的 +2 判定另需余量 →
-//  buf_size 需 >=162（建议 192）；不足时静默丢弃放不下的标志，不溢出。
+//  15 个标志全置位时（含结尾 NUL）需要 160 字节；缓冲区不足时
+//  静默跳过放不下的标志，不会越界写入。
 
-/* 向解码缓冲区追加一个标志字符串，以 '|' 分隔（打嗝其实是） */
+/* 向解码缓冲区追加一个标志字符串，以 '|' 分隔。 */
 static void _sd_status_append(char *buf, uint16_t *pos, uint16_t buf_size, const char *s)
 {
     uint16_t n = (uint16_t)strlen(s);
-    if (*pos + n + 2U < buf_size)
-    {
-        (void)memcpy(buf + *pos, s, n);
-        buf[*pos + n] = '|';
-        *pos += n + 1U;
-    }
+    uint16_t separator = (*pos == 0U) ? 0U : 1U;
+    if ((uint32_t)*pos + separator + n + 1U > buf_size) return;
+    if (separator != 0U) buf[(*pos)++] = '|';
+    (void)memcpy(buf + *pos, s, n);
+    *pos += n;
+    buf[*pos] = '\0';
 }
 
 const char *SD_Decode_Status(uint16_t raw, char *buf, uint16_t buf_size)
@@ -726,7 +808,7 @@ const char *SD_Decode_Status(uint16_t raw, char *buf, uint16_t buf_size)
     if (raw & SD_R2_WP_ERASE_SKIP)    _sd_status_append(buf, &pos, buf_size, "WP_ERASE_SKIP");
     if (raw & SD_R2_CARD_LOCKED)      _sd_status_append(buf, &pos, buf_size, "CARD_LOCKED");
 
-    if (pos > 0U && buf[pos - 1U] == '|') buf[pos - 1U] = '\0'; else buf[0] = '\0';
+    if (pos == 0U) buf[0] = '\0';
     return buf;
 }
 
@@ -785,7 +867,7 @@ int SD_Self_Test_Card(SD_Card *card, uint32_t test_block)
 
 /**
  * @brief 发送 SD 命令帧并读回 R1 应答（以 g_sd_card 的 IO 后端发送）
- * @note  面向调用方的不管理 CS 的公开接口。
+ * @note  面向调用方的完整命令事务接口。
  *         完成 SD SPI 命令帧的封装：CS 拉低 → 发送 6 字节命令帧
  *         (0x40|cmd, arg[31:24..7:0], CRC<<1|1) → 轮询读取 R1 应答 → CS 拉高。
  *         CRC 仅对 CMD0/CMD8 必需，其余命令在 SPI 模式默认关闭 CRC 校验，
@@ -798,10 +880,12 @@ int SD_Self_Test_Card(SD_Card *card, uint32_t test_block)
 uint8_t SD_Send_Command(uint8_t cmd, uint32_t arg, uint8_t crc)
 {
     SD_Card *card = &g_sd_card;
-    if (card->io.spi_byte == NULL) return SD_R1_NO_RESPONSE;
+    if (!_sd_has_required_io(card) || _sd_lock(card) != SD_OK)
+        return SD_R1_NO_RESPONSE;
     /* 复用 _sd_cmd_raw 的帧封装与 R1 轮询，仅在外层补 CS 管理，避免协议逻辑两处重复 */
     SD_IO_CS_LOW(card);
     uint8_t r1 = _sd_cmd_raw(card, cmd, arg, crc);
     SD_IO_CS_HIGH(card);
+    _sd_unlock(card);
     return r1;
 }

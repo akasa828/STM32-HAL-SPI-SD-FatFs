@@ -2,6 +2,7 @@
 #include "sd_stm32_hal.h"
 
 static uint32_t spi_timeout(uint16_t len) { return (uint32_t)len / 2U + 100U; }
+static int prescaler_is_valid(uint32_t value);
 
 static uint8_t io_byte(void *context, uint8_t tx)
 {
@@ -49,9 +50,12 @@ static int io_set_speed(void *context, uint8_t speed)
 {
     SD_STM32_HAL *adapter = (SD_STM32_HAL *)context;
     if (adapter == NULL || adapter->spi == NULL) return SD_PARAM_ERR;
+    if (speed != SD_SPI_SPEED_LOW && speed != SD_SPI_SPEED_HIGH)
+        return SD_PARAM_ERR;
     if (HAL_SPI_GetState(adapter->spi) != HAL_SPI_STATE_READY) return SD_BUSY;
     uint32_t next = speed == SD_SPI_SPEED_HIGH
         ? adapter->high_prescaler : adapter->low_prescaler;
+    if (!prescaler_is_valid(next)) return SD_PARAM_ERR;
     uint32_t previous = adapter->spi->Init.BaudRatePrescaler;
     adapter->spi->Init.BaudRatePrescaler = next;
     if (HAL_SPI_Init(adapter->spi) == HAL_OK) return SD_OK;
@@ -70,20 +74,41 @@ static uint32_t prescaler_divider(uint32_t value)
         case SPI_BAUDRATEPRESCALER_32: return 32U;
         case SPI_BAUDRATEPRESCALER_64: return 64U;
         case SPI_BAUDRATEPRESCALER_128: return 128U;
-        default: return 256U;
+        case SPI_BAUDRATEPRESCALER_256: return 256U;
+        default: return 0U;
     }
+}
+
+static int prescaler_is_valid(uint32_t value)
+{
+    return prescaler_divider(value) != 0U;
+}
+
+static int spi_configuration_is_supported(const SPI_HandleTypeDef *spi)
+{
+    return spi != NULL &&
+           spi->Init.Mode == SPI_MODE_MASTER &&
+           spi->Init.Direction == SPI_DIRECTION_2LINES &&
+           spi->Init.DataSize == SPI_DATASIZE_8BIT &&
+           spi->Init.CLKPolarity == SPI_POLARITY_LOW &&
+           spi->Init.CLKPhase == SPI_PHASE_1EDGE &&
+           spi->Init.NSS == SPI_NSS_SOFT &&
+           spi->Init.FirstBit == SPI_FIRSTBIT_MSB;
 }
 
 static uint32_t io_sck_hz(void *context)
 {
     SD_STM32_HAL *adapter = (SD_STM32_HAL *)context;
+    if (adapter == NULL || adapter->spi == NULL || adapter->spi->Instance == NULL)
+        return 0U;
     uint32_t bus;
     if (adapter->bus_clock_hz != NULL)
         bus = adapter->bus_clock_hz(adapter->user_context, adapter->spi);
     else
         bus = adapter->spi->Instance == SPI1
             ? HAL_RCC_GetPCLK2Freq() : HAL_RCC_GetPCLK1Freq();
-    return bus / prescaler_divider(adapter->spi->Init.BaudRatePrescaler);
+    uint32_t divider = prescaler_divider(adapter->spi->Init.BaudRatePrescaler);
+    return (bus != 0U && divider != 0U) ? bus / divider : 0U;
 }
 
 static uint32_t io_tick(void *context) { (void)context; return HAL_GetTick(); }
@@ -118,8 +143,12 @@ static void io_exit_critical(void *context, uint32_t state)
 
 int SD_STM32_HAL_Attach(SD_Card *card, SD_STM32_HAL *adapter)
 {
-    if (card == NULL || adapter == NULL || adapter->spi == NULL ||
-        adapter->cs_port == NULL || adapter->cs_pin == 0U) return SD_PARAM_ERR;
+    if (card == NULL || adapter == NULL ||
+        !spi_configuration_is_supported(adapter->spi) ||
+        adapter->cs_port == NULL || adapter->cs_pin == 0U ||
+        !prescaler_is_valid(adapter->low_prescaler) ||
+        !prescaler_is_valid(adapter->high_prescaler))
+        return SD_PARAM_ERR;
     SD_IO io = {
         .context = adapter,
         .spi_byte = io_byte,

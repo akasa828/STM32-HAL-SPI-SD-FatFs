@@ -6,6 +6,7 @@
 /*-----------------------------------------------------------------------*/
 
 #include <stddef.h>
+#include <stdint.h>
 #include "ff.h"          /* FatFs 基础类型定义 */
 #include "diskio.h"      /* FatFs 磁盘 I/O 接口声明 */
 #include "SD_reader.h"   /* 本工程 SD 驱动：g_sd_card / SD_*_Card / SD_OK */
@@ -13,6 +14,14 @@
 
 #define DEV_SD   0       /* 唯一物理盘号：SD 卡 */
 static SD_Card *s_card = &g_sd_card;
+
+static DRESULT disk_result_from_sd(int result)
+{
+    if (result == SD_OK) return RES_OK;
+    if (result == SD_PARAM_ERR) return RES_PARERR;
+    if (result == SD_NO_CARD) return RES_NOTRDY;
+    return RES_ERROR;
+}
 
 int SD_FatFs_Attach(SD_Card *card)
 {
@@ -48,12 +57,15 @@ DRESULT disk_read (BYTE pdrv, BYTE *buff, LBA_t sector, UINT count)
 {
     if (pdrv != DEV_SD) return RES_PARERR;
     if (!s_card->info.initialized) return RES_NOTRDY;
-    if (count == 0U) return RES_PARERR;
+    if (buff == NULL || count == 0U) return RES_PARERR;
+#if FF_LBA64
+    if (sector > UINT32_MAX) return RES_PARERR;
+#endif
 
     int r = (count == 1U)
           ? SD_Read_Block_Card(s_card, (uint32_t)sector, buff)
           : SD_Read_Multi_Block_Card(s_card, (uint32_t)sector, buff, (uint32_t)count);
-    return (r == SD_OK) ? RES_OK : RES_ERROR;
+    return disk_result_from_sd(r);
 }
 
 /*-----------------------------------------------------------------------*/
@@ -64,12 +76,15 @@ DRESULT disk_write (BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count)
 {
     if (pdrv != DEV_SD) return RES_PARERR;
     if (!s_card->info.initialized) return RES_NOTRDY;
-    if (count == 0U) return RES_PARERR;
+    if (buff == NULL || count == 0U) return RES_PARERR;
+#if FF_LBA64
+    if (sector > UINT32_MAX) return RES_PARERR;
+#endif
 
     int r = (count == 1U)
           ? SD_Write_Block_Card(s_card, (uint32_t)sector, buff)
           : SD_Write_Multi_Block_Card(s_card, (uint32_t)sector, buff, (uint32_t)count);
-    return (r == SD_OK) ? RES_OK : RES_ERROR;
+    return disk_result_from_sd(r);
 }
 #endif
 
@@ -80,6 +95,8 @@ DRESULT disk_ioctl (BYTE pdrv, BYTE cmd, void *buff)
 {
     if (pdrv != DEV_SD) return RES_PARERR;
     if (!s_card->info.initialized) return RES_NOTRDY;
+
+    if (cmd != CTRL_SYNC && buff == NULL) return RES_PARERR;
 
     switch (cmd) {
     case CTRL_SYNC:            /* 本驱动写操作为同步阻塞，无挂起缓存 */

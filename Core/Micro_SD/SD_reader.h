@@ -292,22 +292,19 @@ typedef struct SD_CardInfo {
 /**
  * @brief SD 卡操作句柄
  * @note  每个物理卡槽对应一个句柄实例。IO 回调 + 卡信息两者合一。
- *        使用前先 SD_Init_Card() 完成初始化握手。
+ *        使用前先由平台层绑定 IO，再调用 SD_Init_Card() 完成初始化握手。
  *
  * @warning 本驱动**非重入**：每个句柄的一次事务会跨多次 SPI 收发持续拉低 CS，
  *          期间独占该实例绑定的 SPI 总线。请仅从主循环（单一上下文）调用，
  *          不要从中断里调用任何 SD_* 接口，也不要在一次事务进行中从别处再次进入。
  *
- *          busy 标志保护的覆盖范围（务必按实际情况理解，勿假设全部加锁）：
- *          - **有锁**：SD_Read_Block_Card / SD_Write_Block_Card /
+ *          busy 标志保护的覆盖范围：
+ *          - **有锁**：SD_Init_Card / SD_Read_Block_Card / SD_Write_Block_Card /
  *            SD_Read_Multi_Block_Card / SD_Write_Multi_Block_Card /
  *            SD_Erase_Blocks_Card。并发进入立即返回 SD_BUSY。
- *          - **无锁**：SD_Get_Status_Card / SD_Card_IsPresent_Card /
- *            SD_Get_CID_Card / SD_Read_SCR_Card
- *            （签名为 const SD_Card*，无法置位 busy）；以及组合型接口
- *            SD_Init_Card / SD_Self_Test_Card / SD_Show_Info_Card。
- *            这些必须由调用方保证单上下文使用——在一次带锁事务进行中调用它们
- *            会交错 SPI 帧并破坏总线。
+ *          - **只读查询**：SD_Get_Status_Card / SD_Card_IsPresent_Card /
+ *            SD_Get_CID_Card / SD_Read_SCR_Card 会在已有事务进行时拒绝访问，
+ *            但仍要求调用方只从单一主循环上下文使用，不可从中断调用。
  */
 typedef struct SD_Card {
     SD_IO       io;          /**< 硬件抽象接口（嵌入，避免二次解引用） */
@@ -335,11 +332,12 @@ int SD_Card_BindIO(SD_Card *card, const SD_IO *io);
  *         CMD8 版本探测 → ACMD41 轮询启动 → CMD58 读 OCR 判 SDHC →
  *         CMD16 设块长（非 SDHC）→ CMD9 读 CSD 算容量 →
  *         CMD10 读 CID → 切高速时钟。所有结果写入 card->info。
- * @param card SD 卡句柄指针（不可为 NULL，io 可为空则自动绑定 STM32 HAL）
+ * @param card SD 卡句柄指针（不可为 NULL，IO 必须已由平台适配层绑定）
  * @retval 正数 = 卡类型 @ref SD_TYPE_V1 / SD_TYPE_V2 / SD_TYPE_V2HC
  * @retval SD_NO_CARD  卡无应答或不兼容
  * @retval SD_TIMEOUT  ACMD41 轮询超时
  * @retval SD_PARAM_ERR card 为 NULL
+ * @retval SD_BUSY 句柄正在执行其他事务
  */
 int SD_Init_Card(SD_Card *card);
 
@@ -347,6 +345,7 @@ int SD_Init_Card(SD_Card *card);
  * @brief 反初始化 SD 卡模块（释放 SPI / DMA / GPIO 资源）
  * @note  用于低功耗场景：关闭 SPI 外设时钟，CS 脚设推挽高电平输出防浮空漏电，
  *         DMA 通道复位，card->info 重置为未就绪。再次使用需重新调用 SD_Init_Card()。
+ *         若句柄正在执行事务，本次调用不会打断传输，也不会修改卡状态。
  * @param card SD 卡句柄指针（不可为 NULL）
  */
 void SD_DeInit_Card(SD_Card *card);
@@ -366,6 +365,7 @@ void SD_DeInit_Card(SD_Card *card);
  * @retval SD_OK 成功
  * @retval SD_PARAM_ERR card 为 NULL 或 speed 非法
  * @retval SD_ERR SPI 重初始化失败（已尽力恢复原分频）
+ * @retval SD_BUSY 句柄正在执行其他事务
  */
 int SD_Set_Speed_Card(SD_Card *card, uint8_t speed);
 
@@ -470,15 +470,14 @@ int SD_Erase_Blocks_Card(SD_Card *card, uint32_t start_block, uint32_t end_block
  *         本函数返回的 16 位字 = (R1 << 8) | 第二状态字节，
  *         可直接与 @ref SD_R2_WP_VIOLATION 等宏做位运算。
  *         （注意：这与 SD 总线模式的 32 位 Card Status 布局不同。）
- * @warning **无 busy 锁**（const 句柄无法置位标志）。不可与带锁的读写事务并发，
- *          也不可从中断调用。详见 @ref SD_Card 的 warning。
+ * @warning 已有事务进行时返回 SD_BUSY；仍不可从中断调用。
  * @param card   SD 卡句柄指针（不可为 NULL，需已初始化）
  * @param status [out] 16 位卡状态原始值（不可为 NULL）
  * @retval SD_OK        读取成功
  * @retval SD_PARAM_ERR card/status 为 NULL 或卡未初始化
  * @retval SD_ERR       CMD13 无应答
  */
-int SD_Get_Status_Card(const SD_Card *card, uint16_t *status);
+int SD_Get_Status_Card(SD_Card *card, uint16_t *status);
 
 /**
  * @brief 使用 CMD58/OCR 进行只读在线检测
@@ -493,7 +492,7 @@ int SD_Card_IsPresent_Card(SD_Card *card);
  * @note  CID 包含制造商 ID（MID）、OEM/应用 ID（OID）、产品名称（PNM）、
  *         产品版本（PRV）、序列号（PSN）、制造日期（MDT）等信息。
  *         SD_Init_Card() 内部已读取并存于 card->info.cid_raw，通常无需再次调用。
- * @warning **无 busy 锁**（const 句柄无法置位标志）。不可与带锁的读写事务并发。
+ * @warning 已有事务进行时返回 SD_BUSY；仍不可从中断调用。
  * @param card SD 卡句柄指针（不可为 NULL，需已初始化）
  * @param buf  [out] 16 字节接收缓冲区（不可为 NULL）
  * @retval SD_OK      读取成功
@@ -501,13 +500,13 @@ int SD_Card_IsPresent_Card(SD_Card *card);
  * @retval SD_TIMEOUT 等待 CID 数据令牌超时
  * @retval SD_ERR     CMD10 被拒
  */
-int SD_Get_CID_Card(const SD_Card *card, uint8_t buf[16]);
+int SD_Get_CID_Card(SD_Card *card, uint8_t buf[16]);
 
 /**
  * @brief 读取 SCR 寄存器 8 字节（ACMD51）
  * @note  SCR 包含 SD 安全规范版本、总线宽度支持、SD 物理层版本等关键信息，
  *         可用于判断卡是否支持更高速度模式。需先发 CMD55 前导。
- * @warning **无 busy 锁**（const 句柄无法置位标志）。不可与带锁的读写事务并发。
+ * @warning 已有事务进行时返回 SD_BUSY；仍不可从中断调用。
  * @param card SD 卡句柄指针（不可为 NULL，需已初始化）
  * @param scr  [out] 8 字节接收缓冲区（不可为 NULL）
  * @retval SD_OK      读取成功
@@ -515,16 +514,15 @@ int SD_Get_CID_Card(const SD_Card *card, uint8_t buf[16]);
  * @retval SD_TIMEOUT 等待 SCR 数据令牌超时
  * @retval SD_ERR     CMD55 或 ACMD51 被拒
  */
-int SD_Read_SCR_Card(const SD_Card *card, uint8_t scr[8]);
+int SD_Read_SCR_Card(SD_Card *card, uint8_t scr[8]);
 
 /**
  * @brief 将 CMD13 R2 原始状态解码为可读字符串
  * @note  线程安全：结果写入调用方提供的缓冲区。原始值为 0 时输出 "OK"。
  *         各标志位以竖线 "|" 分隔，如 "OUT_OF_RANGE|WP_VIOLATION"。
- *         缓冲不足时按内部保护静默丢弃放不下的标志（不会溢出，但会缺项）。
+ *         缓冲不足时静默丢弃放不下的标志（不会溢出，但会缺项）。
  * @param status_raw CMD13 返回的 16 位 SPI R2 状态字（(R1<<8)|byte2）
- * @param buf        [out] 输出缓冲区。全部 15 个标志位同时置位时结果占 160 字节，
- *                   内部追加保护另需 2 字节判定余量 → 需 >= 162，建议给 192。
+ * @param buf        [out] 输出缓冲区。每次追加都会保留结尾 NUL；建议给 192 字节。
  * @param buf_size   缓冲区大小（字节）
  * @retval buf 指针（同入参），便于 printf 直接使用
  */
@@ -556,7 +554,7 @@ uint8_t SD_Get_Type_Card(const SD_Card *card);
  * @brief 计算 CRC16-CCITT（XMODEM，多项式 0x1021，初值 0x0000）
  * @note  参照 SD 物理层规范 §4.5。每 512 字节数据块后跟 2 字节 CRC16（大端）。
  *        仅用于数据块的完整性校验，不用于命令 CRC7。
- * @param data 数据指针
+ * @param data 数据指针；len 非零时不可为 NULL
  * @param len  数据长度（字节）
  * @retval 16 位 CRC 值
  */
