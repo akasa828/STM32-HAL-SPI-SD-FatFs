@@ -69,6 +69,12 @@ After `FR_DISK_ERR`, `FR_NOT_READY`, or card removal, close files, unmount the
 volume, call `SD_DeInit_Card()`, reinitialize the platform peripheral if needed,
 reattach it, and mount again. Do not reuse old `FIL` or `DIR` objects.
 
+## Used in a complete project
+
+This driver was separated from [SD Card OVID Player](https://github.com/akasa828/SD_Card_OVID_Player),
+where it provides SD card access, FatFs file browsing, capacity scanning, and
+card-removal recovery for an STM32F103 OLED video player.
+
 ## Repository layout
 
 - `Core/Micro_SD/` — platform-neutral SD SPI protocol core.

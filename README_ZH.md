@@ -39,4 +39,9 @@
 
 详细接口见 [API 文档](docs/API_ZH.md)，移植步骤见 [移植文档](docs/PORTING_ZH.md)。
 
+## 实际项目
+
+这个驱动从 [SD Card OVID Player](https://github.com/akasa828/SD_Card_OVID_Player) 中拆分而来，
+在该 STM32F103 OLED 播放器中负责 SD 卡访问、FatFs 文件浏览、容量扫描和拔卡恢复。
+
 项目自有代码采用 [MIT License](LICENSE)；FatFs、STM32 HAL 与 CMSIS 保留原许可证，详见[第三方说明](THIRD_PARTY_LICENSES.md)。
