@@ -8,7 +8,7 @@ it does not include STM32 HAL headers, assume a fixed SPI peripheral, own a CS
 pin, or depend on an OLED. The repository can be opened directly in VS Code and
 flashed with `F5`.
 
-![Version](https://img.shields.io/badge/version-v1.0.0-blue)
+![Version](https://img.shields.io/badge/version-v1.0.2-blue)
 [![CI](https://github.com/akasa828/STM32_HAL-SPI_SD-FatFs/actions/workflows/ci.yml/badge.svg)](https://github.com/akasa828/STM32_HAL-SPI_SD-FatFs/actions/workflows/ci.yml)
 ![STM32 HAL](https://img.shields.io/badge/STM32-HAL-03234B)
 ![FatFs](https://img.shields.io/badge/filesystem-FatFs-7B61FF)
@@ -44,6 +44,11 @@ flashed with `F5`.
 > [!WARNING]
 > The demo creates or overwrites `/FS_TEST.TXT`. It does not format the card or
 > run the optional raw-sector self-test.
+
+> [!CAUTION]
+> The optional raw-sector self-test restores the original block when it finishes,
+> but power loss or reset between the test write and restore can still corrupt
+> data. Run it only on a disposable card or a block known to be unused.
 
 ## Reusing the driver
 

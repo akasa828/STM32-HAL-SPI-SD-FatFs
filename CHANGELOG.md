@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.0.2 - 2026-08-25
+
+- Reject CMD58, CMD8, and ACMD41 error responses instead of treating them as
+  card presence, legacy-card detection, or initialization progress.
+- Publish card metadata only after capacity, identity, and the final high-speed
+  switch have all succeeded.
+- Reject STM32 HAL TI mode and hardware CRC configurations that change SD SPI
+  wire semantics.
+- Add deterministic CRC/status boundary coverage and exercise both successful
+  and failed self-test restoration paths.
+- Add GitHub Actions for host regression tests, static analysis, and
+  STM32F103 Debug/Release builds.
+- Clarify that the raw-sector self-test restores data only when execution reaches
+  the restore step and is not safe against power loss.
+
 ## v1.0.1 - 2026-08-23
 
 - Linked the original OVID player as a complete usage example.
