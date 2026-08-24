@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="250" viewBox="0 0 900 250" role="img" aria-labelledby="title desc">
+  <title id="title">Portable SD and FatFs architecture</title>
+  <desc id="desc">Application calls FatFs, which uses the diskio bridge, SD protocol core, hardware callbacks, and SPI SD card.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1726"/>
+      <stop offset="1" stop-color="#101f34"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L7,3 z" fill="#73d0ff"/>
+    </marker>
+  </defs>
+  <rect width="900" height="250" rx="18" fill="url(#bg)"/>
+  <text x="36" y="38" fill="#f0f6fc" font-family="Segoe UI,Arial,sans-serif" font-size="20" font-weight="700">Portable storage path</text>
+  <text x="36" y="62" fill="#8b9eb7" font-family="Segoe UI,Arial,sans-serif" font-size="13">The protocol core knows nothing about STM32, GPIO pins, or the application UI.</text>
+
+  <g font-family="Segoe UI,Arial,sans-serif" text-anchor="middle">
+    <g transform="translate(28 94)">
+      <rect width="124" height="98" rx="12" fill="#192b45" stroke="#395579"/>
+      <text x="62" y="38" fill="#ffffff" font-size="15" font-weight="700">Application</text>
+      <text x="62" y="63" fill="#9fb3c8" font-size="12">files · folders</text>
+      <text x="62" y="80" fill="#9fb3c8" font-size="12">hot-plug flow</text>
+    </g>
+    <g transform="translate(171 94)">
+      <rect width="124" height="98" rx="12" fill="#203556" stroke="#456a99"/>
+      <text x="62" y="38" fill="#ffffff" font-size="15" font-weight="700">FatFs</text>
+      <text x="62" y="63" fill="#a9bdd1" font-size="12">FAT12 · FAT16</text>
+      <text x="62" y="80" fill="#a9bdd1" font-size="12">FAT32</text>
+    </g>
+    <g transform="translate(314 94)">
+      <rect width="124" height="98" rx="12" fill="#183952" stroke="#35769b"/>
+      <text x="62" y="38" fill="#ffffff" font-size="15" font-weight="700">diskio bridge</text>
+      <text x="62" y="63" fill="#9dc7d8" font-size="12">drive binding</text>
+      <text x="62" y="80" fill="#9dc7d8" font-size="12">argument guards</text>
+    </g>
+    <g transform="translate(457 94)">
+      <rect width="124" height="98" rx="12" fill="#143e4c" stroke="#2c8291"/>
+      <text x="62" y="38" fill="#ffffff" font-size="15" font-weight="700">SD core</text>
+      <text x="62" y="63" fill="#9ad0d2" font-size="12">commands · CRC</text>
+      <text x="62" y="80" fill="#9ad0d2" font-size="12">blocks · retries</text>
+    </g>
+    <g transform="translate(600 94)">
+      <rect width="124" height="98" rx="12" fill="#164339" stroke="#2d8b70"/>
+      <text x="62" y="38" fill="#ffffff" font-size="15" font-weight="700">SD_IO</text>
+      <text x="62" y="63" fill="#a4d8c6" font-size="12">STM32 HAL</text>
+      <text x="62" y="80" fill="#a4d8c6" font-size="12">or custom port</text>
+    </g>
+    <g transform="translate(743 94)">
+      <rect width="129" height="98" rx="12" fill="#26422e" stroke="#5a9a62"/>
+      <text x="64.5" y="38" fill="#ffffff" font-size="15" font-weight="700">SPI SD card</text>
+      <text x="64.5" y="63" fill="#b8d7bb" font-size="12">SDSC · SDHC</text>
+      <text x="64.5" y="80" fill="#b8d7bb" font-size="12">SDXC</text>
+    </g>
+  </g>
+  <g stroke="#73d0ff" stroke-width="2" marker-end="url(#arrow)">
+    <path d="M152 143 H168"/>
+    <path d="M295 143 H311"/>
+    <path d="M438 143 H454"/>
+    <path d="M581 143 H597"/>
+    <path d="M724 143 H740"/>
+  </g>
+  <text x="450" y="225" fill="#6f849e" font-family="Segoe UI,Arial,sans-serif" font-size="12" text-anchor="middle">Each boundary can be tested or replaced independently.</text>
+</svg>
