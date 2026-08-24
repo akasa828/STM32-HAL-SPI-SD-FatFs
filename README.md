@@ -9,6 +9,7 @@ pin, or depend on an OLED. The repository can be opened directly in VS Code and
 flashed with `F5`.
 
 ![Version](https://img.shields.io/badge/version-v1.0.0-blue)
+[![CI](https://github.com/akasa828/STM32_HAL-SPI_SD-FatFs/actions/workflows/ci.yml/badge.svg)](https://github.com/akasa828/STM32_HAL-SPI_SD-FatFs/actions/workflows/ci.yml)
 ![STM32 HAL](https://img.shields.io/badge/STM32-HAL-03234B)
 ![FatFs](https://img.shields.io/badge/filesystem-FatFs-7B61FF)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -21,7 +22,7 @@ flashed with `F5`.
 - `SD_IO` with a user context and callbacks for SPI, CS, timing, speed, deinitialization, and critical sections.
 - STM32 HAL adapter accepting any SPI handle, GPIO port, CS pin, and prescalers.
 - FatFs R0.15 bridge with `SD_FatFs_Attach()` and FAT12/FAT16/FAT32 support.
-- Optional non-destructive raw-block self-test without display dependencies.
+- Optional restore-on-completion raw-block self-test without display dependencies.
 
 ## Quick start
 
