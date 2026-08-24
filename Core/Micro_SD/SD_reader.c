@@ -686,7 +686,7 @@ int SD_Card_IsPresent_Card(SD_Card *card)
     if (card == NULL || !card->info.initialized || _sd_lock(card) != SD_OK) return 0;
     SD_IO_CS_LOW(card);
     uint8_t r1 = _sd_cmd_raw(card, SD_CMD58, 0x00000000U, 0x01U);
-    if (r1 & 0x80U) {
+    if (r1 != 0x00U) {
         SD_IO_CS_HIGH(card);
         _sd_unlock(card);
         return 0;

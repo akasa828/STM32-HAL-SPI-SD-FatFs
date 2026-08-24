@@ -701,6 +701,21 @@ static int test_query_transactions(void)
     return 0;
 }
 
+static int test_card_presence_rejects_error_response(void)
+{
+    FakeIO fake;
+    SD_Card card;
+    CHECK(bind_ready_card(&card, &fake) == 0);
+
+    add_command(&fake, SD_CMD58, 0U, 0x01U, 0x04U);
+
+    CHECK(SD_Card_IsPresent_Card(&card) == 0);
+    CHECK(card.busy == 0U);
+    CHECK(fake.enter_count == fake.exit_count);
+    CHECK(script_finished(&fake));
+    return 0;
+}
+
 static int test_busy_queries_and_diskio_guards(void)
 {
     FakeIO fake;
@@ -752,6 +767,7 @@ int main(void)
         {"bad_csd_crc", test_bad_csd_crc},
         {"invalid_v1_csd_block_length", test_invalid_v1_csd_block_length},
         {"query_transactions", test_query_transactions},
+        {"card_presence_rejects_error_response", test_card_presence_rejects_error_response},
         {"busy_queries_and_diskio_guards", test_busy_queries_and_diskio_guards},
     };
 
