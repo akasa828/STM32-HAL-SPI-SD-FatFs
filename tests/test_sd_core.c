@@ -494,6 +494,97 @@ static void script_v1_init_prefix(FakeIO *fake)
     add_command(fake, SD_CMD16, SD_BLOCK_SIZE, 0x01U, 0x00U);
 }
 
+#if SD_ENABLE_SELF_TEST
+static void add_write_block(FakeIO *fake, uint32_t block,
+                            const uint8_t data[SD_BLOCK_SIZE])
+{
+    add_command(fake, SD_CMD24, block, 0x01U, 0x00U);
+    add_byte(fake, 0xFFU, 0xFFU);
+    add_byte(fake, SD_TOKEN_START_BLOCK, 0xFFU);
+    add_send(fake, data, SD_BLOCK_SIZE, SD_OK);
+    const uint16_t crc = SD_CRC16(data, SD_BLOCK_SIZE);
+    add_byte(fake, (uint8_t)(crc >> 8), 0xFFU);
+    add_byte(fake, (uint8_t)crc, 0xFFU);
+    add_byte(fake, 0xFFU, SD_DATA_RESP_ACCEPTED);
+    add_byte(fake, 0xFFU, 0xFFU);
+}
+
+static void add_self_test_initialization(FakeIO *fake)
+{
+    script_v2_init_prefix(fake, 0xC0U);
+    uint8_t csd[16] = {0x40U};
+    csd[9] = 1U;
+    add_command(fake, SD_CMD9, 0U, 0x01U, 0x00U);
+    add_data_packet(fake, csd, sizeof(csd), SD_CRC16(csd, sizeof(csd)));
+    uint8_t cid[16] = {0x51U};
+    add_command(fake, SD_CMD10, 0U, 0x01U, 0x00U);
+    add_data_packet(fake, cid, sizeof(cid), SD_CRC16(cid, sizeof(cid)));
+}
+
+static int test_non_destructive_self_test(void)
+{
+    FakeIO fake;
+    fake_reset(&fake);
+    SD_Card card = {0};
+    SD_IO io = make_io(&fake);
+    CHECK(SD_Card_BindIO(&card, &io) == SD_OK);
+
+    add_self_test_initialization(&fake);
+
+    const uint32_t test_block = 3U;
+    uint8_t saved[SD_BLOCK_SIZE];
+    uint8_t pattern[SD_BLOCK_SIZE];
+    for (uint16_t i = 0U; i < SD_BLOCK_SIZE; ++i) {
+        saved[i] = (uint8_t)(i * 37U);
+        pattern[i] = (uint8_t)(i ^ 0xA5U);
+    }
+    add_command(&fake, SD_CMD17, test_block, 0x01U, 0x00U);
+    add_data_packet(&fake, saved, sizeof(saved), SD_CRC16(saved, sizeof(saved)));
+    add_write_block(&fake, test_block, pattern);
+    add_command(&fake, SD_CMD17, test_block, 0x01U, 0x00U);
+    add_data_packet(&fake, pattern, sizeof(pattern), SD_CRC16(pattern, sizeof(pattern)));
+    add_write_block(&fake, test_block, saved);
+
+    CHECK(SD_Self_Test_Card(&card, test_block) == SD_OK);
+    CHECK(card.busy == 0U);
+    CHECK(script_finished(&fake));
+    return 0;
+}
+
+static int test_self_test_restores_after_mismatch(void)
+{
+    FakeIO fake;
+    fake_reset(&fake);
+    SD_Card card = {0};
+    SD_IO io = make_io(&fake);
+    CHECK(SD_Card_BindIO(&card, &io) == SD_OK);
+    add_self_test_initialization(&fake);
+
+    const uint32_t test_block = 4U;
+    uint8_t saved[SD_BLOCK_SIZE];
+    uint8_t pattern[SD_BLOCK_SIZE];
+    uint8_t corrupted[SD_BLOCK_SIZE];
+    for (uint16_t i = 0U; i < SD_BLOCK_SIZE; ++i) {
+        saved[i] = (uint8_t)(i * 13U);
+        pattern[i] = (uint8_t)(i ^ 0xA5U);
+        corrupted[i] = pattern[i];
+    }
+    corrupted[SD_BLOCK_SIZE / 2U] ^= 0x01U;
+    add_command(&fake, SD_CMD17, test_block, 0x01U, 0x00U);
+    add_data_packet(&fake, saved, sizeof(saved), SD_CRC16(saved, sizeof(saved)));
+    add_write_block(&fake, test_block, pattern);
+    add_command(&fake, SD_CMD17, test_block, 0x01U, 0x00U);
+    add_data_packet(&fake, corrupted, sizeof(corrupted),
+                    SD_CRC16(corrupted, sizeof(corrupted)));
+    add_write_block(&fake, test_block, saved);
+
+    CHECK(SD_Self_Test_Card(&card, test_block) == SD_ERR);
+    CHECK(card.busy == 0U);
+    CHECK(script_finished(&fake));
+    return 0;
+}
+#endif
+
 static int test_full_v2hc_initialization(void)
 {
     FakeIO fake;
@@ -848,6 +939,10 @@ int main(void)
         {"single_write", test_single_write},
         {"single_write_transport_error", test_single_write_transport_error},
         {"multi_write_finish_timeout", test_multi_write_finish_timeout},
+#if SD_ENABLE_SELF_TEST
+        {"non_destructive_self_test", test_non_destructive_self_test},
+        {"self_test_restores_after_mismatch", test_self_test_restores_after_mismatch},
+#endif
         {"full_v2hc_initialization", test_full_v2hc_initialization},
         {"full_v1_initialization_and_byte_addressing", test_full_v1_initialization_and_byte_addressing},
         {"v2_ocr_not_ready", test_v2_ocr_not_ready},

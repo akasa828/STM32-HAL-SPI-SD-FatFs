@@ -53,6 +53,19 @@ target_compile_definitions(test_sd_core_command_crc PRIVATE
 enable_strict_warnings(test_sd_core_command_crc)
 add_test(NAME sd_core_command_crc COMMAND test_sd_core_command_crc)
 
+add_executable(test_sd_self_test
+    test_sd_core.c
+    "${HOST_SOURCE_DIR}/SD_reader.c"
+    "${HOST_SOURCE_DIR}/diskio.c"
+)
+target_include_directories(test_sd_self_test PRIVATE
+    ../Core/Micro_SD
+    ../Core/fatfs
+)
+target_compile_definitions(test_sd_self_test PRIVATE SD_ENABLE_SELF_TEST=1)
+enable_strict_warnings(test_sd_self_test)
+add_test(NAME sd_self_test COMMAND test_sd_self_test)
+
 add_executable(test_sd_hal_adapter
     test_sd_hal_adapter.c
     "${HOST_SOURCE_DIR}/sd_stm32_hal.c"
