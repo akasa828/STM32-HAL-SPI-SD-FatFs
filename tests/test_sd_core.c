@@ -596,6 +596,43 @@ static int test_init_speed_failure(void)
     return 0;
 }
 
+static uint16_t reference_crc16(const uint8_t *data, uint16_t length)
+{
+    uint16_t crc = 0U;
+    for (uint16_t i = 0U; i < length; ++i) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t bit = 0U; bit < 8U; ++bit)
+            crc = (crc & 0x8000U) != 0U
+                ? (uint16_t)((crc << 1) ^ 0x1021U)
+                : (uint16_t)(crc << 1);
+    }
+    return crc;
+}
+
+static int test_crc_and_status_boundaries(void)
+{
+    uint8_t data[SD_BLOCK_SIZE];
+    uint32_t state = 0x6D2B79F5U;
+    for (size_t i = 0U; i < sizeof(data); ++i) {
+        state = state * 1664525U + 1013904223U;
+        data[i] = (uint8_t)(state >> 24);
+    }
+    for (uint16_t length = 0U; length <= SD_BLOCK_SIZE; ++length)
+        CHECK(SD_CRC16(data, length) == reference_crc16(data, length));
+
+    for (uint32_t raw = 0U; raw <= UINT16_MAX; raw += 257U) {
+        for (uint16_t size = 1U; size <= 16U; ++size) {
+            char guarded[18];
+            (void)memset(guarded, 0x5A, sizeof(guarded));
+            char *buffer = &guarded[1];
+            (void)SD_Decode_Status((uint16_t)raw, buffer, size);
+            CHECK(guarded[0] == 0x5A && guarded[size + 1U] == 0x5A);
+            CHECK(memchr(buffer, '\0', size) != NULL);
+        }
+    }
+    return 0;
+}
+
 static int test_cmd8_error_is_not_treated_as_v1(void)
 {
     FakeIO fake;
@@ -800,6 +837,7 @@ int main(void)
         TestFunction function;
     } tests[] = {
         {"crc_and_status", test_crc_and_status},
+        {"crc_and_status_boundaries", test_crc_and_status_boundaries},
         {"binding_and_speed_validation", test_binding_and_speed_validation},
         {"block_range_validation", test_block_range_validation},
         {"transaction_guards", test_transaction_guards},
