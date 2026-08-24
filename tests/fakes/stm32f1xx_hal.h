@@ -35,6 +35,10 @@ extern SPI_TypeDef g_fake_spi2;
 #define SPI_NSS_HARD_INPUT    0x0000U
 #define SPI_FIRSTBIT_MSB      0x0000U
 #define SPI_FIRSTBIT_LSB      0x0080U
+#define SPI_TIMODE_DISABLE    0x0000U
+#define SPI_TIMODE_ENABLE     0x0800U
+#define SPI_CRCCALCULATION_DISABLE 0x0000U
+#define SPI_CRCCALCULATION_ENABLE  0x2000U
 
 typedef struct {
     uint32_t Mode;
@@ -45,6 +49,9 @@ typedef struct {
     uint32_t NSS;
     uint32_t BaudRatePrescaler;
     uint32_t FirstBit;
+    uint32_t TIMode;
+    uint32_t CRCCalculation;
+    uint32_t CRCPolynomial;
 } SPI_InitTypeDef;
 
 typedef struct {

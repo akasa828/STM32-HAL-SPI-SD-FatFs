@@ -93,7 +93,9 @@ static int spi_configuration_is_supported(const SPI_HandleTypeDef *spi)
            spi->Init.CLKPolarity == SPI_POLARITY_LOW &&
            spi->Init.CLKPhase == SPI_PHASE_1EDGE &&
            spi->Init.NSS == SPI_NSS_SOFT &&
-           spi->Init.FirstBit == SPI_FIRSTBIT_MSB;
+           spi->Init.FirstBit == SPI_FIRSTBIT_MSB &&
+           spi->Init.TIMode == SPI_TIMODE_DISABLE &&
+           spi->Init.CRCCalculation == SPI_CRCCALCULATION_DISABLE;
 }
 
 static uint32_t io_sck_hz(void *context)

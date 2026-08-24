@@ -80,6 +80,9 @@ int main(void)
             .NSS = SPI_NSS_SOFT,
             .BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256,
             .FirstBit = SPI_FIRSTBIT_MSB,
+            .TIMode = SPI_TIMODE_DISABLE,
+            .CRCCalculation = SPI_CRCCALCULATION_DISABLE,
+            .CRCPolynomial = 10U,
         },
     };
     uint32_t bus_clock = 72000000U;
@@ -103,6 +106,12 @@ int main(void)
     CHECK(SD_STM32_HAL_Attach(&card, &invalid) == SD_PARAM_ERR);
     invalid_spi = spi;
     invalid_spi.Init.CLKPhase = SPI_PHASE_2EDGE;
+    CHECK(SD_STM32_HAL_Attach(&card, &invalid) == SD_PARAM_ERR);
+    invalid_spi = spi;
+    invalid_spi.Init.TIMode = SPI_TIMODE_ENABLE;
+    CHECK(SD_STM32_HAL_Attach(&card, &invalid) == SD_PARAM_ERR);
+    invalid_spi = spi;
+    invalid_spi.Init.CRCCalculation = SPI_CRCCALCULATION_ENABLE;
     CHECK(SD_STM32_HAL_Attach(&card, &invalid) == SD_PARAM_ERR);
     CHECK(SD_STM32_HAL_Attach(&card, &adapter) == SD_OK);
     CHECK(g_bound_io.get_sck_hz(g_bound_io.context) == 281250U);
