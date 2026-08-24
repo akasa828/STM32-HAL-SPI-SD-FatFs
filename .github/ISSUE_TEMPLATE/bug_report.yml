@@ -1,0 +1,37 @@
+name: Bug report
+description: Report a reproducible SD, SPI, FatFs, or build problem
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to provide a reproducible hardware report.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include the expected result, actual result, and the smallest reproduction you can provide.
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and card
+      description: MCU, SD module or level shifter, card type/capacity, supply voltage, SPI clock, and wiring length.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Return codes and logs
+      description: Paste exact driver/FatFs return codes, serial output, and the commit or release used.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data safety
+      options:
+        - label: I reproduced this with a disposable card or backed up the card first.
+          required: true

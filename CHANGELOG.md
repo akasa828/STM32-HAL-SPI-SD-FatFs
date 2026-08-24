@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Rework the English and Chinese project pages around the portable storage
+  stack, runnable demo, minimal integration path, and verified behavior.
+- Add an architecture diagram, contribution guide, issue forms, and pull
+  request checklist.
+
 ## v1.0.2 - 2026-08-25
 
 - Reject CMD58, CMD8, and ACMD41 error responses instead of treating them as
