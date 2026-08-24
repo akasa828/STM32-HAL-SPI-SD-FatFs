@@ -596,6 +596,52 @@ static int test_init_speed_failure(void)
     return 0;
 }
 
+static int test_cmd8_error_is_not_treated_as_v1(void)
+{
+    FakeIO fake;
+    fake_reset(&fake);
+    SD_Card card = {0};
+    SD_IO io = make_io(&fake);
+    CHECK(SD_Card_BindIO(&card, &io) == SD_OK);
+    add_repeat(&fake, 0xFFU, 0xFFU, 10U);
+    add_command(&fake, SD_CMD0, 0U, 0x95U, SD_R1_IDLE_STATE);
+    add_command(&fake, SD_CMD8, 0x000001AAU, 0x87U,
+                SD_R1_IDLE_STATE | SD_R1_ILLEGAL_CMD | 0x08U);
+
+    CHECK(SD_Init_Card(&card) == SD_NO_CARD);
+    CHECK(card.info.type == SD_TYPE_NONE);
+    CHECK(card.info.initialized == 0U);
+    CHECK(card.busy == 0U);
+    CHECK(script_finished(&fake));
+    return 0;
+}
+
+static int test_acmd41_error_stops_initialization(void)
+{
+    FakeIO fake;
+    fake_reset(&fake);
+    SD_Card card = {0};
+    SD_IO io = make_io(&fake);
+    CHECK(SD_Card_BindIO(&card, &io) == SD_OK);
+    add_repeat(&fake, 0xFFU, 0xFFU, 10U);
+    add_command(&fake, SD_CMD0, 0U, 0x95U, SD_R1_IDLE_STATE);
+    add_command(&fake, SD_CMD8, 0x000001AAU, 0x87U, SD_R1_IDLE_STATE);
+    add_repeat(&fake, 0xFFU, 0x00U, 2U);
+    add_byte(&fake, 0xFFU, 0x01U);
+    add_byte(&fake, 0xFFU, 0xAAU);
+#if SD_ENABLE_CMD_CRC
+    add_command(&fake, SD_CMD59, 1U, 0x01U, 0x00U);
+#endif
+    add_app_command(&fake, SD_ACMD41, 0x40000000U,
+                    SD_R1_IDLE_STATE, SD_R1_ILLEGAL_CMD);
+
+    CHECK(SD_Init_Card(&card) == SD_ERR);
+    CHECK(card.info.initialized == 0U);
+    CHECK(card.busy == 0U);
+    CHECK(script_finished(&fake));
+    return 0;
+}
+
 static int test_high_speed_failure_after_initialization(void)
 {
     FakeIO fake;
@@ -616,6 +662,11 @@ static int test_high_speed_failure_after_initialization(void)
     CHECK(SD_Init_Card(&card) == SD_ERR);
     CHECK(card.info.initialized == 0U);
     CHECK(card.info.speed == SD_SPI_SPEED_LOW);
+    CHECK(card.info.type == SD_TYPE_NONE);
+    CHECK(card.info.block_addr == 0U);
+    CHECK(card.info.ocr == 0U);
+    CHECK(card.info.block_count == 0U);
+    CHECK(card.info.capacity_mb == 0U);
     CHECK(fake.speed_calls == 2U);
     CHECK(card.busy == 0U);
     CHECK(script_finished(&fake));
@@ -763,6 +814,8 @@ int main(void)
         {"full_v1_initialization_and_byte_addressing", test_full_v1_initialization_and_byte_addressing},
         {"v2_ocr_not_ready", test_v2_ocr_not_ready},
         {"init_speed_failure", test_init_speed_failure},
+        {"cmd8_error_is_not_treated_as_v1", test_cmd8_error_is_not_treated_as_v1},
+        {"acmd41_error_stops_initialization", test_acmd41_error_stops_initialization},
         {"high_speed_failure_after_initialization", test_high_speed_failure_after_initialization},
         {"bad_csd_crc", test_bad_csd_crc},
         {"invalid_v1_csd_block_length", test_invalid_v1_csd_block_length},

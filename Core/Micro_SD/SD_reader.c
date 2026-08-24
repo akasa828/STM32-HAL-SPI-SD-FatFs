@@ -345,28 +345,18 @@ int SD_Set_Speed_Card(SD_Card *card, uint8_t speed)
     return result;
 }
 
-//====================================================================
-//  SD_Init_Card — 完整初始化握手协议
-//====================================================================
-//  流程：探测/确保低速(<400kHz) → >=74 空闲时钟 → CMD0 软复位 →
-//  CMD8 版本探测 → ACMD41 轮询启动 → CMD58 读 OCR 判 SDHC →
-//  CMD16 设块长（非 SDHC）→ CMD9 读 CSD 算容量 → CMD10 读 CID →
-//  切高速时钟。所有结果写入 card->info。
-static int _sd_initialize_unlocked(SD_Card *card)
+static void _sd_reset_card_info(SD_Card *card)
 {
-    /* 先置未就绪并清零，握手成功后再原子发布，避免并发读到 initialized=1 而 block_addr 尚为 0 */
-    card->info.initialized = 0U;
     (void)memset(&card->info, 0x00, sizeof(card->info));
     card->info.type  = SD_TYPE_NONE;
     card->info.speed = SD_SPI_SPEED_NULL;
+}
 
-    if (_sd_prepare_init_speed(card) != SD_OK) return SD_ERR;
-
-    /* 1) >=74 idle clocks */
+static int _sd_enter_idle(SD_Card *card)
+{
     SD_IO_CS_HIGH(card);
     for (uint8_t i = 0; i < 10U; ++i) (void)SD_IO_BYTE(card, 0xFFU);
 
-    /* 2) CMD0 */
     uint8_t r1 = SD_R1_NO_RESPONSE;
     for (uint8_t retry = 0; retry < 20U; ++retry)
     {
@@ -375,119 +365,147 @@ static int _sd_initialize_unlocked(SD_Card *card)
         SD_IO_CS_HIGH(card);
         if (r1 == SD_R1_IDLE_STATE) break;
     }
-    if (r1 != SD_R1_IDLE_STATE) return SD_NO_CARD;
+    return r1 == SD_R1_IDLE_STATE ? SD_OK : SD_NO_CARD;
+}
 
-    /* 3) CMD8。先判“无应答”再判非法命令位：0xFF & 0x04 也为真，
-     *    若不先排除会把信号不良导致的无应答误判成 V1，进而对 SDHC 用错寻址。 */
-    uint8_t card_type;
+static int _sd_detect_version(SD_Card *card, uint8_t *card_type)
+{
     SD_IO_CS_LOW(card);
-    r1 = _sd_cmd_raw(card, SD_CMD8, 0x000001AAU, 0x87U);
-    if (r1 == SD_R1_NO_RESPONSE)        { SD_IO_CS_HIGH(card); return SD_NO_CARD; }
-    else if (r1 & SD_R1_ILLEGAL_CMD)    { card_type = SD_TYPE_V1; }
-    else if ((r1 & ~0x80U) == SD_R1_IDLE_STATE)
-    {
+    const uint8_t r1 = _sd_cmd_raw(card, SD_CMD8, 0x000001AAU, 0x87U);
+    if (r1 == (SD_R1_IDLE_STATE | SD_R1_ILLEGAL_CMD)) {
+        *card_type = SD_TYPE_V1;
+    } else if (r1 == SD_R1_IDLE_STATE) {
         uint8_t r7[4];
         for (uint8_t i = 0; i < 4U; ++i) r7[i] = SD_IO_BYTE(card, 0xFFU);
-        card_type = ((r7[2] & 0x0FU) == 0x01U && r7[3] == 0xAAU) ? SD_TYPE_V2 : SD_TYPE_NONE;
+        *card_type = ((r7[2] & 0x0FU) == 0x01U && r7[3] == 0xAAU)
+            ? SD_TYPE_V2 : SD_TYPE_NONE;
+    } else {
+        *card_type = SD_TYPE_NONE;
     }
-    else { card_type = SD_TYPE_NONE; }
     SD_IO_CS_HIGH(card);
-    if (card_type == SD_TYPE_NONE) return SD_NO_CARD;
+    return *card_type == SD_TYPE_NONE ? SD_NO_CARD : SD_OK;
+}
 
+static void _sd_try_enable_command_crc(SD_Card *card)
+{
 #if SD_ENABLE_CMD_CRC
-    /* 3.5) CMD59 开启卡端 CRC 校验（仅在 io.crc_check 开启时）。须在 idle 阶段、ACMD41 之前下发。
-     *      arg bit0=1 表示开启。开启后 _sd_cmd_raw 会为每条命令现算 CRC7。
-     *      老卡可能不支持：若被拒则放弃卡端校验（读侧 CRC16 仍由本机校验，写侧不受卡校验）。 */
-    if (card->io.crc_check)
-    {
+    if (card->io.crc_check) {
         SD_IO_CS_LOW(card);
-        uint8_t rc = _sd_cmd_raw(card, SD_CMD59, 0x00000001U, 0x01U);
+        (void)_sd_cmd_raw(card, SD_CMD59, 0x00000001U, 0x01U);
         SD_IO_CS_HIGH(card);
-        if (rc & 0x80U)   /* 无有效应答/不支持 → 退回不依赖卡端 CRC（本机仍算并发送/校验） */
-        {
-            /* 不改 crc_check：本机继续算 CRC7/CRC16，卡虽不强制校验，多发正确 CRC 无害 */
-        }
     }
+#else
+    (void)card;
 #endif
+}
 
-    /* 4) ACMD41。CMD55 与 ACMD41 之间保留一个字节的命令间隔，兼容需要
-     *    明确 Ncr/Ncc 时序裕量的卡。 */
+static int _sd_wait_until_initialized(SD_Card *card, uint8_t card_type)
+{
     uint32_t arg41 = (card_type == SD_TYPE_V2) ? 0x40000000U : 0x00000000U;
     uint32_t t0 = SD_IO_TICK(card);
-    do {
+    for (;;) {
         SD_IO_CS_LOW(card);
-        r1 = _sd_app_cmd_raw(card, SD_ACMD41, arg41);
+        const uint8_t r1 = _sd_app_cmd_raw(card, SD_ACMD41, arg41);
         SD_IO_CS_HIGH(card);
-        if ((SD_IO_TICK(card) - t0) > SD_ACMD41_TIMEOUT_MS) return SD_TIMEOUT;   /* 可配置上电裕量 */
-    } while (r1 != 0x00U);
-
-    /* 5) CMD58 */
-    if (card_type == SD_TYPE_V2)
-    {
-        SD_IO_CS_LOW(card);
-        r1 = _sd_cmd_raw(card, SD_CMD58, 0x00000000U, 0x01U);
-        if (r1 != 0x00U) { SD_IO_CS_HIGH(card); return SD_ERR; }
-        uint8_t ocr[4];
-        for (uint8_t i = 0; i < 4U; ++i) ocr[i] = SD_IO_BYTE(card, 0xFFU);
-        SD_IO_CS_HIGH(card);
-        card->info.ocr = ((uint32_t)ocr[0] << 24) | ((uint32_t)ocr[1] << 16)
-                       | ((uint32_t)ocr[2] <<  8) |  (uint32_t)ocr[3];
-        if ((card->info.ocr & 0x80000000UL) == 0U) return SD_ERR;
-        if (ocr[0] & 0x40U) card_type = SD_TYPE_V2HC;
+        if (r1 == 0x00U) return SD_OK;
+        if (r1 != SD_R1_IDLE_STATE) return SD_ERR;
+        if ((SD_IO_TICK(card) - t0) > SD_ACMD41_TIMEOUT_MS) return SD_TIMEOUT;
     }
+}
 
-    /* 6) CMD16（非 SDHC 设块长 512）。检查 R1：正常 512 是上电默认值，
-     *    但若卡处于异常状态拒绝，需暴露错误而非带病继续。 */
-    if (card_type != SD_TYPE_V2HC)
-    {
-        SD_IO_CS_LOW(card);
-        r1 = _sd_cmd_raw(card, SD_CMD16, SD_BLOCK_SIZE, 0x01U);
-        SD_IO_CS_HIGH(card);
-        if (r1 != 0x00U) return SD_ERR;
+static int _sd_read_ocr(SD_Card *card, SD_CardInfo *info, uint8_t *card_type)
+{
+    if (*card_type != SD_TYPE_V2) return SD_OK;
+    SD_IO_CS_LOW(card);
+    const uint8_t r1 = _sd_cmd_raw(card, SD_CMD58, 0x00000000U, 0x01U);
+    if (r1 != 0x00U) { SD_IO_CS_HIGH(card); return SD_ERR; }
+    uint8_t ocr[4];
+    for (uint8_t i = 0; i < 4U; ++i) ocr[i] = SD_IO_BYTE(card, 0xFFU);
+    SD_IO_CS_HIGH(card);
+    info->ocr = ((uint32_t)ocr[0] << 24) | ((uint32_t)ocr[1] << 16)
+              | ((uint32_t)ocr[2] << 8) | (uint32_t)ocr[3];
+    if ((info->ocr & 0x80000000UL) == 0U) return SD_ERR;
+    if ((ocr[0] & 0x40U) != 0U) *card_type = SD_TYPE_V2HC;
+    return SD_OK;
+}
+
+static int _sd_set_block_length(SD_Card *card, uint8_t card_type)
+{
+    if (card_type == SD_TYPE_V2HC) return SD_OK;
+    SD_IO_CS_LOW(card);
+    const uint8_t r1 = _sd_cmd_raw(card, SD_CMD16, SD_BLOCK_SIZE, 0x01U);
+    SD_IO_CS_HIGH(card);
+    return r1 == 0x00U ? SD_OK : SD_ERR;
+}
+
+static int _sd_decode_capacity(const uint8_t csd[16], SD_CardInfo *info)
+{
+    const uint8_t version = (csd[0] >> 6) & 0x03U;
+    uint64_t block_count;
+    if (version == 0x01U) {
+        const uint32_t csize = ((uint32_t)(csd[7] & 0x3FU) << 16)
+                             | ((uint32_t)csd[8] << 8) | (uint32_t)csd[9];
+        block_count = ((uint64_t)csize + 1U) * 1024U;
+    } else if (version == 0x00U) {
+        const uint16_t csize = ((uint16_t)(csd[6] & 0x03U) << 10)
+                             | ((uint16_t)csd[7] << 2) | ((uint16_t)csd[8] >> 6);
+        const uint8_t cmult = ((csd[9] & 0x03U) << 1) | ((csd[10] >> 7) & 0x01U);
+        const uint8_t block_length = csd[5] & 0x0FU;
+        if (block_length > 11U) return SD_ERR;
+        const uint64_t bytes = ((uint64_t)csize + 1U)
+                             * ((uint64_t)1U << (cmult + 2U))
+                             * ((uint64_t)1U << block_length);
+        block_count = bytes / SD_BLOCK_SIZE;
+    } else {
+        return SD_ERR;
     }
+    if (block_count == 0U) return SD_ERR;
+    info->block_count = block_count > UINT32_MAX ? UINT32_MAX : (uint32_t)block_count;
+    info->capacity_mb = info->block_count / SD_BLOCKS_PER_MB;
+    return SD_OK;
+}
 
-    /* 7) CSD */
-    {
-        uint8_t csd[16];
-        int packet_result = _sd_read_register_unlocked(card, SD_CMD9,
-                                                       csd, sizeof(csd));
-        if (packet_result != SD_OK) return packet_result;
-        (void)memcpy(card->info.csd_raw, csd, 16U);
-        uint8_t ver = (csd[0] >> 6) & 0x03U;
-        if (ver == 0x01U)
-        {
-            uint32_t csize = ((uint32_t)(csd[7] & 0x3FU) << 16) | ((uint32_t)csd[8] << 8) | (uint32_t)csd[9];
-            /* 64 位中间量防溢出：SDXC 极限 C_SIZE 时 (csize+1)*1024 可达 2^32 → uint32 回绕为 0 */
-            uint64_t bc = ((uint64_t)csize + 1U) * 1024U;
-            card->info.block_count = (bc > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)bc;
-        }
-        else if (ver == 0x00U)
-        {
-            uint16_t csize = ((uint16_t)(csd[6] & 0x03U) << 10) | ((uint16_t)csd[7] << 2) | ((uint16_t)csd[8] >> 6);
-            uint8_t  cmult = ((csd[9] & 0x03U) << 1) | ((csd[10] >> 7) & 0x01U);
-            uint8_t  blen  = csd[5] & 0x0FU;
-            if (blen > 11U) return SD_ERR;
-            uint64_t bytes = ((uint64_t)csize + 1U) *
-                             ((uint64_t)1U << (cmult + 2U)) *
-                             ((uint64_t)1U << blen);
-            uint64_t bc = bytes / SD_BLOCK_SIZE;
-            card->info.block_count = (bc > UINT32_MAX) ? UINT32_MAX : (uint32_t)bc;
-        }
-        else { return SD_ERR; }
-        if (card->info.block_count == 0U) return SD_ERR;
-        card->info.capacity_mb = card->info.block_count / SD_BLOCKS_PER_MB;
-    }
+static int _sd_read_identity(SD_Card *card, SD_CardInfo *info)
+{
+    int result = _sd_read_register_unlocked(card, SD_CMD9,
+                                            info->csd_raw,
+                                            sizeof(info->csd_raw));
+    if (result != SD_OK) return result;
+    result = _sd_decode_capacity(info->csd_raw, info);
+    if (result != SD_OK) return result;
+    return _sd_read_register_unlocked(card, SD_CMD10,
+                                      info->cid_raw,
+                                      sizeof(info->cid_raw));
+}
 
-    /* 8) CID */
-    int cid_result = _sd_read_register_unlocked(card, SD_CMD10,
-                                                card->info.cid_raw,
-                                                sizeof(card->info.cid_raw));
-    if (cid_result != SD_OK) return cid_result;
+static int _sd_initialize_unlocked(SD_Card *card)
+{
+    _sd_reset_card_info(card);
+    if (_sd_prepare_init_speed(card) != SD_OK) return SD_ERR;
 
-    card->info.type        = card_type;
-    card->info.block_addr  = (card_type == SD_TYPE_V2HC) ? 1U : 0U;
+    SD_CardInfo discovered = {0};
+    uint8_t card_type = SD_TYPE_NONE;
+    int result = _sd_enter_idle(card);
+    if (result != SD_OK) return result;
+    result = _sd_detect_version(card, &card_type);
+    if (result != SD_OK) return result;
+    _sd_try_enable_command_crc(card);
+    result = _sd_wait_until_initialized(card, card_type);
+    if (result != SD_OK) return result;
+    result = _sd_read_ocr(card, &discovered, &card_type);
+    if (result != SD_OK) return result;
+    result = _sd_set_block_length(card, card_type);
+    if (result != SD_OK) return result;
+    result = _sd_read_identity(card, &discovered);
+    if (result != SD_OK) return result;
     if (_sd_set_speed_unlocked(card, SD_SPI_SPEED_HIGH) != SD_OK) return SD_ERR;
-    card->info.initialized = 1U;   /* 全部就绪后最后发布，确保读到 initialized=1 时信息完整 */
+
+    discovered.type = card_type;
+    discovered.block_addr = card_type == SD_TYPE_V2HC ? 1U : 0U;
+    discovered.speed = card->info.speed;
+    discovered.initialized = 0U;
+    card->info = discovered;
+    card->info.initialized = 1U;
     return (int)card_type;
 }
 
